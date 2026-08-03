@@ -621,9 +621,120 @@ body.is-dragging .editable:hover { background: none; cursor: grabbing; }
   flex: 1;
   min-height: 0;
   overflow: auto;
-  padding: var(--s5) var(--s4);
+  padding: var(--s5);
   width: var(--panel-w);   /* keeps contents from reflowing during the slide */
   max-width: 100%;
+}
+#panel-body:focus { outline: none; }
+
+.panel-title {
+  width: 100%;
+  padding: 0 0 var(--s2);
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -.02em;
+  outline: none;
+}
+.panel-title::placeholder { color: var(--text-faint); }
+
+.panel-field { margin-top: var(--s5); }
+
+.panel-label {
+  display: block;
+  margin-bottom: var(--s2);
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.panel-hint {
+  margin-top: var(--s2);
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.panel-input {
+  display: block;
+  width: 100%;
+  padding: var(--s3);
+  border: 1px solid var(--border);
+  border-radius: var(--r2);
+  background: var(--surface-2);
+  color: var(--text);
+  font: inherit;
+  line-height: 1.55;
+  resize: none;
+  overflow: hidden;         /* height is driven by content, see autoGrow */
+  transition: border-color var(--dur-fast), background var(--dur-fast);
+}
+.panel-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  background: var(--surface);
+}
+.panel-desc { min-height: 150px; }
+
+.panel-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s3);
+  margin-top: var(--s6);
+  padding-top: var(--s4);
+  border-top: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.panel-where {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.panel-swatch {
+  width: 10px;
+  height: 10px;
+  flex: none;
+  border-radius: 3px;
+  background: var(--tier-color, var(--surface-3));
+}
+.panel-where span {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.panel-delete {
+  flex: none;
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r1);
+  color: var(--text-dim);
+  font-size: 12px;
+  transition: color var(--dur-fast), border-color var(--dur-fast),
+              background var(--dur-fast);
+}
+.panel-delete:hover {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+.panel-delete.confirming {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}
+.panel-delete.confirming:hover { color: #fff; }
+
+/* The card whose details are open. */
+.item.is-selected {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 
 /* ==========================================================================
@@ -680,7 +791,7 @@ body.is-dragging .editable:hover { background: none; cursor: grabbing; }
       <div id="panel-head">
         <button id="panel-close" type="button" title="Close (Esc)" aria-label="Close">✕</button>
       </div>
-      <div id="panel-body"></div>
+      <div id="panel-body" tabindex="-1"></div>
     </aside>
   </div>
 </div>
@@ -962,18 +1073,47 @@ function addItem() {
   return id;
 }
 
-function renameItem(id, name) {
-  commit(() => { const item = getItem(id); if (item) item.name = name; });
+/**
+ * Applies an edit made in the detail panel.
+ *
+ * Deliberately does not re-render: the board is rebuilt wholesale by render(),
+ * which would tear the focused field out from under the caret on every
+ * keystroke. Only the affected card is refreshed, and only once typing pauses.
+ */
+function updateItem(id, mutate) {
+  commit(() => {
+    const item = getItem(id);
+    if (item) mutate(item);
+  }, { silent: true });
+  scheduleCardRefresh(id);
+}
+
+let cardRefreshTimer = 0;
+
+function scheduleCardRefresh(id) {
+  clearTimeout(cardRefreshTimer);
+  cardRefreshTimer = setTimeout(() => refreshItemCard(id), 120);
+}
+
+function refreshItemCard(id) {
+  const node = findCardNode(id);
+  const item = getItem(id);
+  if (node && item) node.replaceWith(renderItem(item));
 }
 
 function deleteItem(id) {
+  // Drop the selection first so commit()'s render closes the panel in the
+  // same pass rather than needing a second one.
+  if (runtime.selectedItemId === id) {
+    runtime.panelOpen = false;
+    runtime.selectedItemId = null;
+  }
   commit(() => {
     const loc = locateItem(id);
     if (loc) loc.list.splice(loc.index, 1);
     delete state.items[id];
     // Phase 5: release the item's image if no other item references it.
   });
-  if (runtime.selectedItemId === id) closePanel();
 }
 
 /* --- two-step delete ------------------------------------------------------ */
@@ -1160,13 +1300,9 @@ function renderItem(item) {
     el("span", { text: hasShort ? short : "—" }),
   ]);
 
-  const name = el("div", {
-    class: "item-name editable",
-    text: item.name,
-    title: item.name + " — click to rename",
-    onclick: event => startRename(
-      event.currentTarget, item.name, next => renameItem(item.id, next)),
-  });
+  // Renaming lives in the detail panel, which is the single editing surface
+  // for everything about an item.
+  const name = el("div", { class: "item-name", text: item.name });
 
   const tools = el("div", { class: "item-tools" }, [
     el("button", {
@@ -1182,36 +1318,135 @@ function renderItem(item) {
     }),
   ]);
 
+  const selected = runtime.panelOpen && runtime.selectedItemId === item.id;
+
   return el("div", {
-    class: "item",
+    class: "item" + (selected ? " is-selected" : ""),
     dataset: { itemId: item.id },
+    tabindex: "0",
+    title: item.name,
+    onclick: event => {
+      if (event.target.closest(".item-tools")) return;
+      openPanel(item.id);
+    },
   }, [tools, body, name]);
+}
+
+function findCardNode(id) {
+  for (const node of dom.boardScroll.querySelectorAll(".item")) {
+    if (node.dataset.itemId === id) return node;
+  }
+  return null;
 }
 
 /* --- detail panel --------------------------------------------------------- */
 
 function renderPanel() {
-  const open = runtime.panelOpen && runtime.selectedItemId != null;
+  const item = runtime.panelOpen ? getItem(runtime.selectedItemId) : null;
+  const open = item != null;
+
   dom.main.classList.toggle("panel-open", open);
   dom.panel.setAttribute("aria-hidden", open ? "false" : "true");
 
   clear(dom.panelBody);
   if (!open) return;
 
-  // Phase 4 builds the real editing surface here.
-  const item = getItem(runtime.selectedItemId);
-  if (item) dom.panelBody.append(el("div", { text: item.name }));
+  const loc = locateItem(item.id);
+  const tier = loc ? loc.tier : null;
+  const armed = runtime.pendingDelete === "item:" + item.id;
+
+  const title = el("input", {
+    class: "panel-title",
+    type: "text",
+    value: item.name,
+    placeholder: "Untitled",
+    "aria-label": "Item name",
+    oninput: event => updateItem(item.id, draft => { draft.name = event.target.value; }),
+  });
+
+  // Phase 5 wraps this field in the Text / Image mode switch.
+  const short = el("textarea", {
+    class: "panel-input panel-short",
+    rows: "2",
+    placeholder: "Shown on the card",
+    "aria-label": "Short description",
+    oninput: event => {
+      autoGrow(event.target);
+      updateItem(item.id, draft => { draft.shortText = event.target.value; });
+    },
+  });
+  short.value = item.shortText || "";
+
+  const description = el("textarea", {
+    class: "panel-input panel-desc",
+    placeholder: "Anything worth saying at length…",
+    "aria-label": "Description",
+    oninput: event => {
+      autoGrow(event.target);
+      updateItem(item.id, draft => { draft.description = event.target.value; });
+    },
+  });
+  description.value = item.description || "";
+
+  const meta = el("div", { class: "panel-meta" }, [
+    el("div", {
+      class: "panel-where",
+      style: tier ? { "--tier-color": tier.color } : {},
+    }, [
+      el("span", { class: "panel-swatch" }),
+      el("span", { text: tier ? tier.name : "Unassigned" }),
+    ]),
+    el("button", {
+      class: "panel-delete" + (armed ? " confirming" : ""),
+      type: "button",
+      text: armed ? "Delete for good?" : "Delete item",
+      onclick: () => {
+        if (!armed) return armDelete("item:" + item.id);
+        runtime.pendingDelete = null;
+        deleteItem(item.id);
+      },
+    }),
+  ]);
+
+  dom.panelBody.append(
+    title,
+    el("div", { class: "panel-field" }, [
+      el("label", { class: "panel-label", text: "Short description" }),
+      short,
+      el("div", { class: "panel-hint", text: "Displayed on the card itself." }),
+    ]),
+    el("div", { class: "panel-field" }, [
+      el("label", { class: "panel-label", text: "Description" }),
+      description,
+    ]),
+    meta,
+  );
+
+  autoGrow(short);
+  autoGrow(description);
+}
+
+/** Textareas grow with their content instead of scrolling internally. */
+function autoGrow(textarea) {
+  textarea.style.height = "auto";
+  textarea.style.height = textarea.scrollHeight + "px";
 }
 
 function openPanel(itemId) {
   runtime.selectedItemId = itemId;
   runtime.panelOpen = true;
-  renderPanel();
+  render();               // selection outlines change across the whole board
+  dom.panelBody.focus();
 }
 
 function closePanel() {
+  const wasShowing = runtime.selectedItemId;
   runtime.panelOpen = false;
-  renderPanel();
+  render();
+
+  // Hand focus back to where it came from.
+  const card = findCardNode(wasShowing);
+  if (card) card.focus();
 }
 
 /* ==========================================================================
@@ -1596,10 +1831,45 @@ function swallowNextClick() {
    7. EVENTS
    ========================================================================== */
 
+/**
+ * Wide viewports give the panel its own column and the board stays reachable,
+ * so focus is free to leave. Narrow ones have it float over the board, where
+ * tabbing to something underneath it would be tabbing into nowhere.
+ */
+function isPanelOverlaying() {
+  return typeof window.matchMedia === "function" &&
+         window.matchMedia("(max-width: 1100px)").matches;
+}
+
+function trapTab(event) {
+  const focusable = dom.panel.querySelectorAll("input, textarea, button, [tabindex]");
+  if (focusable.length === 0) return;
+
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  const active = document.activeElement;
+
+  if (event.shiftKey && (active === first || !dom.panel.contains(active))) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && active === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
 function bindEvents() {
   dom.panelClose.addEventListener("click", closePanel);
 
   dom.boardScroll.addEventListener("pointerdown", onBoardPointerDown);
+
+  // Clicking bare board space dismisses the panel; clicking a card or a tier
+  // control does not.
+  dom.boardScroll.addEventListener("click", event => {
+    if (!runtime.panelOpen) return;
+    if (event.target.closest(".item, .tier-label, .tier-tools")) return;
+    closePanel();
+  });
 
   dom.title.classList.add("editable");
   dom.title.title = "Click to rename";
@@ -1617,6 +1887,10 @@ function bindEvents() {
   });
 
   document.addEventListener("keydown", event => {
+    if (event.key === "Tab" && runtime.panelOpen && isPanelOverlaying()) {
+      trapTab(event);
+      return;
+    }
     if (event.key !== "Escape") return;
     if (runtime.drag) {
       releaseDragListeners();

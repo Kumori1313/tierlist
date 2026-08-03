@@ -175,10 +175,10 @@ correctly laid out at desktop and narrow widths.
 - Tier renaming: click the label to edit in place (`contenteditable` or a swapped
   `<input>`), commit on blur/Enter, cancel on Escape.
 - Tier colour: swatch picker on the tier label.
-- Item renaming: the same inline editor, on the card's name footer. (Originally deferred
-  to the detail panel in Phase 4 to keep one editing surface — but that left Phase 1
-  unable to name items at all, contradicting its own exit criterion. The panel still
-  gets a name field in Phase 4; the two edit the same value.)
+- Item renaming: the same inline editor, on the card's name footer — a stopgap so that
+  Phase 1 can meet its own exit criterion of naming everything by clicking. Phase 4
+  moves it into the detail panel and takes it off the card, restoring the single
+  editing surface.
 - List title renaming, same editor. Phase 6 derives the export filename from it.
 
 **Done when:** a full tierlist can be constructed and named entirely by clicking, with
