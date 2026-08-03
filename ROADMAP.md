@@ -265,8 +265,9 @@ the panel feels like a Notion page peek — quiet, keyboard-dismissible, non-mod
 
 - A two-option segmented control in the panel: **Text** / **Image**. Switching modes
   sets `shortType`; the inactive field's value is *retained* in state so toggling back
-  and forth is non-destructive, but only the active one is rendered on the card and only
-  the active one is meaningful on export.
+  and forth is non-destructive. Only the active one is rendered on the card — but both
+  are exported, or the round trip would quietly destroy whichever mode was switched
+  away from before saving.
 - Image intake, three paths: file picker button, drag a file from the OS onto the image
   drop area, and paste from clipboard while the panel is focused.
 - Validation: accept `image/png`, `image/jpeg`, `image/webp`, `image/gif`, `image/avif`.
@@ -300,8 +301,11 @@ other, and no orphaned object URLs leak across a long session.
 - Filename derived from the list title, slugified, `.tierlist` extension.
 
 **6b — Serialization**
-- Walk state, assign each referenced image a stable archive path, write `images` metadata,
-  stamp `modifiedAt`, drop unreferenced images.
+- Walk state, write `images` metadata, stamp `modifiedAt`, drop unreferenced images.
+  "Referenced" means some item's `image` field names it — *not* that the item is
+  currently in image mode, since a retained image belonging to a text-mode item must
+  survive the round trip. Paths are assigned at upload and never rewritten, so an
+  item's archive path is stable across exports.
 
 **6c — ZIP reader**
 - Locate EOCD by scanning backwards from the end (handles a trailing comment).
