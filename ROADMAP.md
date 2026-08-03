@@ -350,13 +350,21 @@ including images, with no manual export step.
 
 **Goal:** the difference between a demo and something usable daily.
 
-- **Undo/redo** (`Ctrl+Z` / `Ctrl+Shift+Z`) over a bounded stack of state snapshots.
-  Cheap to add once all mutations funnel through a single `commit()` — worth routing
-  them that way from Phase 0.
-- **Keyboard accessibility**: every drag operation needs a non-pointer equivalent —
-  select a card, then move it with arrow keys / bracket keys across tiers. Tiers get
-  ARIA list semantics; the detail panel is announced properly; drag state is exposed via
-  `aria-grabbed`-equivalent live-region messaging.
+- **Undo/redo** (`Ctrl+Z` / `Ctrl+Shift+Z` / `Ctrl+Y`) over a bounded stack of state
+  snapshots. Cheap to add because every mutation funnels through `commit()` — the seam
+  left open in Phase 0. Consecutive edits to one field coalesce into a single step, so
+  typing a name is one undo rather than twenty. Image bytes are kept alive as long as
+  any snapshot still names them, or undoing a removal would restore an item pointing at
+  bytes that had already been freed; a sweep runs when snapshots fall off the end.
+  The shortcut is not taken inside text fields, where the browser's own undo belongs.
+- **Keyboard accessibility**: every drag has a keyboard equivalent, restoring what
+  removing the `<select>` in Phase 2 cost. It follows pick-up / move / drop — Space
+  picks up, arrows move, Space drops, Escape puts it back — rather than having bare
+  arrows move things, so unheld arrows stay free to walk between cards, which is what a
+  keyboard user expects a list to do. Same gesture on a tier's handle reorders rows.
+  Moves go through `commit()`, so they are undoable and autosaved like any other.
+  Tiers and drop zones get ARIA list semantics, cards carry a position description, and
+  every move is announced through a live region.
 - **Responsive**: below ~700px the tier rows scroll horizontally and the detail panel
   becomes a bottom sheet.
 - **Empty states**: an empty pool, an empty tier, and a fresh list each say something
@@ -367,8 +375,10 @@ including images, with no manual export step.
   What remains here is routing quota failures into the same place and deciding
   whether anything genuinely warrants a transient toast rather than a persistent
   banner. Nothing should ever fail silently or via `alert()`.
-- **PNG snapshot export** (nice-to-have): render the board to a canvas for sharing.
-  Distinct from the config export and explicitly one-way.
+- **PNG snapshot export**: the board drawn onto a canvas by hand — not SVG
+  `foreignObject`, which cannot reach `blob:` images and would not carry the page's CSS.
+  Explicitly one-way and distinct from the config export. The unassigned pool is left
+  out: this is a picture of the ranking, not of the workspace.
 - Cross-browser pass: Chrome, Firefox, Safari — particularly `CompressionStream`
   behaviour, pointer capture on touch, and `file://` restrictions.
 

@@ -626,6 +626,23 @@ body.is-dragging .item,
 body.is-dragging .tier-grip { cursor: grabbing; }
 body.is-dragging .editable:hover { background: none; cursor: grabbing; }
 
+/* Held by the keyboard rather than the pointer. Reads as lifted, not as the
+   translucent hole a pointer drag leaves behind, because the thing itself is
+   still where you are looking. */
+.item.is-grabbed,
+.tier.is-grabbed {
+  position: relative;
+  z-index: 1;
+  outline: 2px dashed var(--accent);
+  outline-offset: 2px;
+  box-shadow: var(--shadow-2);
+}
+.tier-grip.is-grabbed {
+  background: var(--accent);
+  color: #fff;
+  opacity: 1;
+}
+
 .tier-drop.is-drop-target,
 #pool-drop.is-drop-target {
   background: var(--surface-2);
@@ -914,6 +931,52 @@ body.is-dragging .editable:hover { background: none; cursor: grabbing; }
   .tier-name { font-size: 17px; }
   #header { padding: 0 var(--s3); gap: var(--s2); }
   .tool-btn { padding: 6px 9px; }
+
+  /* Too little width to wrap into: rows scroll sideways instead. */
+  .tier-drop,
+  #pool-drop {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+  }
+  .item { flex: none; }
+
+  /* The toolbar outgrows the header before the board outgrows the screen. */
+  #toolbar {
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  #toolbar::-webkit-scrollbar { display: none; }
+
+  /* The panel becomes a sheet from the bottom, where a thumb can reach it. */
+  #panel {
+    top: auto;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    width: 100%;
+    max-height: 82vh;
+    border-left: 0;
+    border-top: 1px solid var(--border);
+    border-radius: var(--r3) var(--r3) 0 0;
+    transform: translateY(100%);
+  }
+  #main.panel-open #panel { transform: none; }
+  #panel-body { width: 100%; padding: var(--s4); }
+
+  /* A grab handle for the sheet, purely as an affordance. */
+  #panel-head::before {
+    content: "";
+    position: absolute;
+    top: 8px;
+    left: 50%;
+    width: 36px;
+    height: 4px;
+    margin-left: -18px;
+    border-radius: 2px;
+    background: var(--border-strong);
+  }
+  #panel-head { position: relative; }
 }
 </style>
 </head>
@@ -946,6 +1009,10 @@ body.is-dragging .editable:hover { background: none; cursor: grabbing; }
     </aside>
   </div>
 </div>
+
+<!-- Screen-reader announcements for moves that have no visual equivalent
+     in the reading order. -->
+<div id="live" class="visually-hidden" role="status" aria-live="polite"></div>
 
 <!-- Dragged cards are rendered here, above everything and outside any
      scroll container or overflow clip. -->
@@ -1019,6 +1086,8 @@ const runtime = {
   banner: null,
   /** persistence, see section 8. `available` is null until probed. */
   storage: { available: null, db: null, error: null },
+  /** keyboard pick-up, see section 9 */
+  grab: null,
 };
 
 function createEmptyDocument() {
@@ -1067,13 +1136,97 @@ function newId(prefix) {
  * @param {boolean}    [opts.silent]  skip the re-render (caller will do it)
  */
 function commit(mutate, opts = {}) {
-  // Phase 8: push a snapshot onto the undo stack here, before mutating.
+  if (!opts.skipHistory) pushHistory(opts.coalesce);
   mutate();
+  if (history.evicted) {
+    history.evicted = false;
+    collectImages();
+  }
   state.modifiedAt = new Date().toISOString();
   runtime.dirty = true;
   scheduleSave();
   if (!opts.silent) render();
 }
+
+/* --- history --------------------------------------------------------------
+ *
+ * Snapshots of the whole document rather than inverse operations: the document
+ * is small, and every mutation already funnels through commit(), so there is
+ * exactly one place to capture. Image bytes are not snapshotted — they live in
+ * runtime.images and are kept alive as long as any snapshot still names them
+ * (see releaseImage).
+ */
+
+const HISTORY_LIMIT = 60;
+/** how long edits sharing a coalesce key fold into one undo step */
+const COALESCE_MS = 1200;
+
+const history = { past: [], future: [], lastKey: null, lastAt: 0, evicted: false };
+
+function snapshot() {
+  return typeof structuredClone === "function"
+    ? structuredClone(state)
+    : JSON.parse(JSON.stringify(state));
+}
+
+/**
+ * @param {string} [key] edits sharing a key in quick succession — typing in
+ *   one field — collapse into a single undo step instead of one per keystroke.
+ */
+function pushHistory(key) {
+  const now = Date.now();
+  if (key && key === history.lastKey && now - history.lastAt < COALESCE_MS) {
+    history.lastAt = now;
+    return;
+  }
+
+  history.past.push(snapshot());
+  if (history.past.length > HISTORY_LIMIT) {
+    history.past.shift();
+    // That snapshot may have been an image's last reference — but the sweep
+    // has to wait until after the mutation, or it would collect an image the
+    // caller is in the middle of attaching.
+    history.evicted = true;
+  }
+  history.future.length = 0;
+  history.lastKey = key || null;
+  history.lastAt = now;
+}
+
+function clearHistory() {
+  history.past.length = 0;
+  history.future.length = 0;
+  history.lastKey = null;
+  collectImages();
+}
+
+/**
+ * Sweeps image bytes nothing can reach any more. Needed because an image can
+ * become unreachable without anyone touching it — when the snapshot that was
+ * its last reference falls off the end of the history.
+ */
+function collectImages() {
+  for (const path of [...runtime.images.keys()]) releaseImage(path);
+}
+
+function stepHistory(from, to) {
+  if (from.length === 0) return false;
+  to.push(snapshot());
+  state = from.pop();
+  history.lastKey = null;
+  runtime.dirty = true;
+  runtime.grab = null;
+  if (!getItem(runtime.selectedItemId)) {
+    runtime.panelOpen = false;
+    runtime.selectedItemId = null;
+  }
+  scheduleSave();
+  render();
+  return true;
+}
+
+const undo = () => stepHistory(history.past, history.future);
+const redo = () => stepHistory(history.future, history.past);
 
 /* --- lookups -------------------------------------------------------------- */
 
@@ -1250,11 +1403,11 @@ function addItem() {
  * which would tear the focused field out from under the caret on every
  * keystroke. Only the affected card is refreshed, and only once typing pauses.
  */
-function updateItem(id, mutate) {
+function updateItem(id, mutate, field) {
   commit(() => {
     const item = getItem(id);
     if (item) mutate(item);
-  }, { silent: true });
+  }, { silent: true, coalesce: field ? "item:" + id + ":" + field : undefined });
   scheduleCardRefresh(id);
 }
 
@@ -1414,12 +1567,18 @@ function setShortType(itemId, type) {
   });
 }
 
-/** Frees an image's bytes and URL once no item points at it any more. */
+/**
+ * Frees an image's bytes and URL once nothing points at it any more — which
+ * includes undo history, or undoing a removal would restore an item pointing
+ * at bytes that had already been freed.
+ */
 function releaseImage(path) {
   if (!path) return;
-  for (const item of Object.values(state.items)) {
-    if (item.image === path) return;
-  }
+
+  const referencedBy = doc => Object.values(doc.items || {}).some(item => item.image === path);
+  if (referencedBy(state)) return;
+  if (history.past.some(referencedBy) || history.future.some(referencedBy)) return;
+
   const entry = runtime.images.get(path);
   if (entry) {
     URL.revokeObjectURL(entry.url);
@@ -1458,6 +1617,7 @@ function cacheDom() {
   dom.banner     = $("#banner");
   dom.boardScroll = $("#board-scroll");
   dom.dragLayer  = $("#drag-layer");
+  dom.live       = $("#live");
   dom.title      = $("#list-title");
   dom.toolbar    = $("#toolbar");
   dom.tiers      = $("#tiers");
@@ -1509,6 +1669,10 @@ function renderHeader() {
       class: "tool-btn", type: "button", text: "Save", title: "Download this list as a .tierlist file",
       onclick: exportList,
     }),
+    el("button", {
+      class: "tool-btn", type: "button", text: "PNG", title: "Download a picture of the ranking",
+      onclick: exportSnapshot,
+    }),
   );
 }
 
@@ -1537,6 +1701,8 @@ function renderBanner() {
 
 function renderTiers() {
   clear(dom.tiers);
+  dom.tiers.setAttribute("role", "list");
+  dom.tiers.setAttribute("aria-label", "Tiers");
   for (const tier of state.tiers) {
     dom.tiers.append(renderTier(tier));
   }
@@ -1544,18 +1710,21 @@ function renderTiers() {
 
 function renderTier(tier) {
   const confirming = runtime.pendingDelete === "tier:" + tier.id;
+  const grabbed = runtime.grab && runtime.grab.kind === "tier" && runtime.grab.id === tier.id;
 
   const label = el("div", {
     class: "tier-label",
     style: { "--tier-color": tier.color },
   }, confirming ? renderTierConfirm(tier) : [
-    // Not reachable by keyboard yet — Phase 8 adds the keyboard route for
-    // both reordering and placement.
-    el("div", {
-      class: "tier-grip",
-      title: "Drag to reorder",
-      "aria-hidden": "true",
+    el("button", {
+      class: "tier-grip" + (grabbed ? " is-grabbed" : ""),
+      type: "button",
+      title: "Drag, or press space to move with the arrow keys",
+      "aria-label": "Reorder tier " + (tier.name || "untitled"),
+      "aria-pressed": grabbed ? "true" : "false",
+      dataset: { tierId: tier.id },
       text: "⠿",
+      onkeydown: event => onGripKeyDown(event, tier.id),
     }),
     el("div", {
       class: "tier-name editable",
@@ -1568,11 +1737,13 @@ function renderTier(tier) {
 
   const drop = el("div", {
     class: "tier-drop",
+    role: "list",
+    "aria-label": (tier.name || "Untitled") + " tier",
     dataset: { dropZone: "tier", tierId: tier.id },
   });
 
   if (tier.items.length === 0) {
-    drop.append(el("div", { class: "empty-hint", text: "Empty" }));
+    drop.append(el("div", { class: "empty-hint", text: "Drop items here" }));
   } else {
     for (const id of tier.items) {
       const item = getItem(id);
@@ -1598,7 +1769,8 @@ function renderTier(tier) {
   ]);
 
   return el("div", {
-    class: "tier",
+    class: "tier" + (grabbed ? " is-grabbed" : ""),
+    role: "listitem",
     dataset: { tierId: tier.id },
   }, [label, drop, tools]);
 }
@@ -1631,10 +1803,16 @@ function renderPool() {
   clear(dom.poolDrop);
   dom.poolDrop.dataset.dropZone = "pool";
 
+  dom.poolDrop.setAttribute("role", "list");
+  dom.poolDrop.setAttribute("aria-label", "Unassigned items");
+
   if (state.pool.length === 0) {
+    const nothingAnywhere = Object.keys(state.items).length === 0;
     dom.poolDrop.append(el("div", {
       class: "empty-hint",
-      text: "Unranked items collect here.",
+      text: nothingAnywhere
+        ? "Nothing here yet — use “Add item” to start, then drag items into a tier."
+        : "Unranked items collect here.",
     }));
     return;
   }
@@ -1689,16 +1867,23 @@ function renderItem(item) {
   ]);
 
   const selected = runtime.panelOpen && runtime.selectedItemId === item.id;
+  const grabbed = runtime.grab && runtime.grab.kind === "item" && runtime.grab.id === item.id;
 
   return el("div", {
-    class: "item" + (selected ? " is-selected" : "") + (entry ? " has-image" : ""),
+    class: "item" + (selected ? " is-selected" : "") + (entry ? " has-image" : "") +
+           (grabbed ? " is-grabbed" : ""),
+    role: "listitem",
     dataset: { itemId: item.id },
     tabindex: "0",
     title: item.name,
+    "aria-label": item.name + ", " + describeItemPosition(item.id) +
+                  ". Enter for details, space to move.",
+    "aria-grabbed": grabbed ? "true" : "false",
     onclick: event => {
       if (event.target.closest(".item-tools")) return;
       openPanel(item.id);
     },
+    onkeydown: event => onCardKeyDown(event, item.id),
   }, [tools, body, name]);
 }
 
@@ -1741,7 +1926,7 @@ function renderPanel() {
     "aria-label": "Short description",
     oninput: event => {
       autoGrow(event.target);
-      updateItem(item.id, draft => { draft.shortText = event.target.value; });
+      updateItem(item.id, draft => { draft.shortText = event.target.value; }, "shortText");
     },
   });
   short.value = item.shortText || "";
@@ -1752,7 +1937,7 @@ function renderPanel() {
     "aria-label": "Description",
     oninput: event => {
       autoGrow(event.target);
-      updateItem(item.id, draft => { draft.description = event.target.value; });
+      updateItem(item.id, draft => { draft.description = event.target.value; }, "description");
     },
   });
   description.value = item.description || "";
@@ -1899,6 +2084,9 @@ function openPanel(itemId) {
   runtime.panelError = null;
   render();               // selection outlines change across the whole board
   dom.panelBody.focus();
+
+  const item = getItem(itemId);
+  announce("Details for " + (item ? item.name : "item") + ". Press escape to close.");
 }
 
 function closePanel() {
@@ -2596,6 +2784,180 @@ function downloadBlob(blob, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 
+/* --- snapshot ------------------------------------------------------------
+ *
+ * A one-way PNG of the ranking, for sharing. Drawn onto a canvas by hand
+ * rather than via SVG foreignObject, which cannot reach blob: images and
+ * would not carry the page's CSS anyway. The pool is deliberately left out:
+ * this is a picture of the ranking, not of the workspace.
+ */
+
+const SNAP = {
+  scale: 2,
+  pad: 14,
+  gap: 8,
+  card: 96,
+  label: 132,
+  maxColumns: 12,
+  titleBand: 56,
+  ink: "#14161a",
+  bg: "#14161a",
+  row: "#1b1e24",
+  cardBg: "#22262e",
+  cardEdge: "#333945",
+  text: "#e8eaef",
+  dim: "#a2a9b8",
+};
+
+function fitText(ctx, text, maxWidth) {
+  if (ctx.measureText(text).width <= maxWidth) return text;
+  let cut = text;
+  while (cut.length > 1 && ctx.measureText(cut + "…").width > maxWidth) {
+    cut = cut.slice(0, -1);
+  }
+  return cut + "…";
+}
+
+function boxPath(ctx, x, y, w, h, r) {
+  if (ctx.roundRect) {
+    ctx.beginPath();
+    ctx.roundRect(x, y, w, h, r);
+  } else {
+    ctx.beginPath();
+    ctx.rect(x, y, w, h);
+  }
+}
+
+/** Draws src into a w×h box, cropping the overflow rather than squashing. */
+function drawCover(ctx, source, x, y, w, h) {
+  const scale = Math.max(w / source.width, h / source.height);
+  const sw = w / scale;
+  const sh = h / scale;
+  ctx.drawImage(source,
+    (source.width - sw) / 2, (source.height - sh) / 2, sw, sh,
+    x, y, w, h);
+}
+
+async function renderSnapshot() {
+  const columns = clamp(
+    state.tiers.reduce((most, tier) => Math.max(most, tier.items.length), 1),
+    4, SNAP.maxColumns);
+
+  const rowsFor = tier => Math.max(1, Math.ceil(tier.items.length / columns));
+  const heightFor = tier =>
+    SNAP.pad * 2 + rowsFor(tier) * SNAP.card + (rowsFor(tier) - 1) * SNAP.gap;
+
+  const width = SNAP.label + SNAP.pad * 2 + columns * SNAP.card + (columns - 1) * SNAP.gap;
+  const height = SNAP.titleBand +
+    state.tiers.reduce((sum, tier) => sum + heightFor(tier) + 2, 0) + SNAP.pad;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width * SNAP.scale;
+  canvas.height = height * SNAP.scale;
+  const ctx = canvas.getContext("2d");
+  ctx.scale(SNAP.scale, SNAP.scale);
+  ctx.textBaseline = "middle";
+
+  ctx.fillStyle = SNAP.bg;
+  ctx.fillRect(0, 0, width, height);
+
+  ctx.fillStyle = SNAP.text;
+  ctx.font = "600 22px ui-sans-serif, system-ui, sans-serif";
+  ctx.textAlign = "left";
+  ctx.fillText(fitText(ctx, state.title, width - SNAP.pad * 2), SNAP.pad, SNAP.titleBand / 2 + 2);
+
+  // Decode every image once up front; drawing is synchronous after this.
+  const bitmaps = new Map();
+  for (const item of Object.values(state.items)) {
+    if (item.shortType !== "image" || !item.image || bitmaps.has(item.image)) continue;
+    const held = runtime.images.get(item.image);
+    if (!held) continue;
+    try {
+      bitmaps.set(item.image, await createImageBitmap(held.blob));
+    } catch (error) {
+      // A picture that will not decode simply falls back to its name.
+    }
+  }
+
+  let y = SNAP.titleBand;
+  for (const tier of state.tiers) {
+    const rowHeight = heightFor(tier);
+
+    ctx.fillStyle = tier.color;
+    ctx.fillRect(0, y, SNAP.label, rowHeight);
+    ctx.fillStyle = SNAP.row;
+    ctx.fillRect(SNAP.label, y, width - SNAP.label, rowHeight);
+
+    ctx.fillStyle = SNAP.ink;
+    ctx.font = "700 20px ui-sans-serif, system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(fitText(ctx, tier.name || "", SNAP.label - 12), SNAP.label / 2, y + rowHeight / 2);
+
+    tier.items.forEach((id, index) => {
+      const item = getItem(id);
+      if (!item) return;
+
+      const column = index % columns;
+      const row = Math.floor(index / columns);
+      const x = SNAP.label + SNAP.pad + column * (SNAP.card + SNAP.gap);
+      const top = y + SNAP.pad + row * (SNAP.card + SNAP.gap);
+
+      ctx.save();
+      boxPath(ctx, x, top, SNAP.card, SNAP.card, 8);
+      ctx.clip();
+
+      const bitmap = item.shortType === "image" && bitmaps.get(item.image);
+      if (bitmap) {
+        drawCover(ctx, bitmap, x, top, SNAP.card, SNAP.card);
+        const scrim = ctx.createLinearGradient(0, top + SNAP.card - 34, 0, top + SNAP.card);
+        scrim.addColorStop(0, "rgba(0,0,0,0)");
+        scrim.addColorStop(1, "rgba(0,0,0,0.82)");
+        ctx.fillStyle = scrim;
+        ctx.fillRect(x, top + SNAP.card - 34, SNAP.card, 34);
+        ctx.fillStyle = "#ffffff";
+      } else {
+        ctx.fillStyle = SNAP.cardBg;
+        ctx.fillRect(x, top, SNAP.card, SNAP.card);
+
+        const short = (item.shortText || "").trim();
+        if (short) {
+          ctx.fillStyle = SNAP.dim;
+          ctx.font = "12px ui-sans-serif, system-ui, sans-serif";
+          ctx.textAlign = "center";
+          ctx.fillText(fitText(ctx, short, SNAP.card - 12), x + SNAP.card / 2, top + SNAP.card / 2 - 8);
+        }
+        ctx.fillStyle = SNAP.text;
+      }
+
+      ctx.font = "600 12px ui-sans-serif, system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(fitText(ctx, item.name, SNAP.card - 10),
+                   x + SNAP.card / 2, top + SNAP.card - 13);
+      ctx.restore();
+
+      ctx.strokeStyle = SNAP.cardEdge;
+      ctx.lineWidth = 1;
+      boxPath(ctx, x + .5, top + .5, SNAP.card - 1, SNAP.card - 1, 8);
+      ctx.stroke();
+    });
+
+    y += rowHeight + 2;
+  }
+
+  for (const bitmap of bitmaps.values()) {
+    if (bitmap.close) bitmap.close();
+  }
+  return canvasToBlob(canvas, "image/png");
+}
+
+async function exportSnapshot() {
+  try {
+    downloadBlob(await renderSnapshot(), slugify(state.title) + ".png");
+  } catch (error) {
+    showBanner({ tone: "warn", text: "Could not render an image: " + error.message });
+  }
+}
+
 /* --- import --------------------------------------------------------------- */
 
 const asString = (value, fallback) => typeof value === "string" ? value : fallback;
@@ -2795,6 +3157,7 @@ function installDocument(doc, images) {
   for (const [path, held] of images) runtime.images.set(path, held);
 
   state = doc;
+  clearHistory();     // there is no undoing across a document replacement
   runtime.selectedItemId = null;
   runtime.panelOpen = false;
   runtime.panelError = null;
@@ -2833,9 +3196,20 @@ function requestImport(file) {
   });
 }
 
+let bannerTimer = 0;
+
 function showBanner(banner) {
   runtime.banner = banner;
   renderBanner();
+
+  // Confirmations and warnings stay until acted on; a plain acknowledgement
+  // should not need dismissing.
+  clearTimeout(bannerTimer);
+  if (banner && banner.tone !== "warn" && !banner.actions) {
+    bannerTimer = setTimeout(() => {
+      if (runtime.banner === banner) dismissBanner();
+    }, 6000);
+  }
 }
 
 function dismissBanner() {
@@ -3067,7 +3441,224 @@ function newList() {
 }
 
 /* ==========================================================================
-   9. EVENTS
+   9. KEYBOARD
+
+   Every drag has a keyboard equivalent, following the pick-up / move / drop
+   pattern rather than making bare arrow keys move things: unheld arrows stay
+   free to walk between cards, which is what a keyboard user expects a list to
+   do. Space picks up, arrows move, Space drops, Escape puts it back.
+
+   Movements go through commit() like any other, so they are undoable and
+   autosaved, and each one is announced to screen readers.
+   ========================================================================== */
+
+const clamp = (value, low, high) => Math.min(high, Math.max(low, value));
+
+function announce(message) {
+  if (!dom.live) return;
+  // Re-setting identical text does not re-announce; clear first.
+  dom.live.textContent = "";
+  dom.live.textContent = message;
+}
+
+/** Where a grabbed thing started, so Escape can put it back. */
+function captureOrigin(kind, id) {
+  if (kind === "tier") {
+    return { index: state.tiers.findIndex(tier => tier.id === id) };
+  }
+  const loc = locateItem(id);
+  if (!loc) return null;
+  return { zone: loc.tier ? loc.tier.id : "pool", index: loc.index };
+}
+
+function itemLists() {
+  return [
+    ...state.tiers.map(tier => ({ list: tier.items, name: tier.name })),
+    { list: state.pool, name: "Unassigned" },
+  ];
+}
+
+function describeItemPosition(id) {
+  const loc = locateItem(id);
+  if (!loc) return "";
+  const where = loc.tier ? "tier " + loc.tier.name : "Unassigned";
+  return where + ", position " + (loc.index + 1) + " of " + loc.list.length;
+}
+
+function toggleGrab(kind, id) {
+  if (runtime.grab && runtime.grab.id === id) return dropGrab();
+
+  const origin = captureOrigin(kind, id);
+  if (!origin) return;
+
+  runtime.grab = { kind, id, origin };
+  render();
+  refocusGrabbed();
+
+  if (kind === "tier") {
+    const tier = getTier(id);
+    announce("Picked up tier " + (tier ? tier.name : "") +
+             ". Use up and down to move it, space to drop, escape to cancel.");
+  } else {
+    const item = getItem(id);
+    announce("Picked up " + (item ? item.name : "") + ", " + describeItemPosition(id) +
+             ". Use the arrow keys to move it, space to drop, escape to cancel.");
+  }
+}
+
+function dropGrab() {
+  const grab = runtime.grab;
+  if (!grab) return false;
+  runtime.grab = null;
+  render();
+  refocusGrabbed(grab);
+  announce(grab.kind === "tier"
+    ? "Tier dropped."
+    : "Dropped in " + describeItemPosition(grab.id) + ".");
+  return true;
+}
+
+function cancelGrab() {
+  const grab = runtime.grab;
+  if (!grab) return false;
+  runtime.grab = null;
+
+  if (grab.kind === "tier") {
+    commit(() => {
+      const index = state.tiers.findIndex(tier => tier.id === grab.id);
+      if (index === -1) return;
+      const [row] = state.tiers.splice(index, 1);
+      state.tiers.splice(clamp(grab.origin.index, 0, state.tiers.length), 0, row);
+    });
+  } else {
+    commit(() => {
+      const loc = locateItem(grab.id);
+      if (loc) loc.list.splice(loc.index, 1);
+      const tier = grab.origin.zone === "pool" ? null : getTier(grab.origin.zone);
+      const list = tier ? tier.items : state.pool;
+      list.splice(clamp(grab.origin.index, 0, list.length), 0, grab.id);
+    });
+  }
+
+  refocusGrabbed(grab);
+  announce("Move cancelled.");
+  return true;
+}
+
+function refocusGrabbed(grab = runtime.grab) {
+  if (!grab) return;
+  if (grab.kind === "tier") {
+    const row = dom.tiers.querySelectorAll(".tier-grip")
+      .find(node => node.dataset.tierId === grab.id);
+    if (row) row.focus();
+  } else {
+    focusCard(grab.id);
+  }
+}
+
+function focusCard(id) {
+  const node = findCardNode(id);
+  if (node) node.focus();
+}
+
+function moveGrabbedItem(dx, dy) {
+  const grab = runtime.grab;
+  const loc = locateItem(grab.id);
+  if (!loc) return;
+
+  if (dy !== 0) {
+    const lists = itemLists();
+    const from = loc.tier
+      ? state.tiers.findIndex(tier => tier.id === loc.tier.id)
+      : state.tiers.length;
+    const to = clamp(from + dy, 0, lists.length - 1);
+    if (to === from) return;
+
+    commit(() => {
+      loc.list.splice(loc.index, 1);
+      const target = lists[to].list;
+      target.splice(clamp(loc.index, 0, target.length), 0, grab.id);
+    });
+  } else {
+    const to = clamp(loc.index + dx, 0, loc.list.length - 1);
+    if (to === loc.index) return;
+
+    commit(() => {
+      loc.list.splice(loc.index, 1);
+      loc.list.splice(to, 0, grab.id);
+    });
+  }
+
+  focusCard(grab.id);
+  announce(describeItemPosition(grab.id));
+}
+
+function moveGrabbedTier(dy) {
+  const grab = runtime.grab;
+  const from = state.tiers.findIndex(tier => tier.id === grab.id);
+  const to = clamp(from + dy, 0, state.tiers.length - 1);
+  if (from === -1 || to === from) return;
+
+  commit(() => {
+    const [row] = state.tiers.splice(from, 1);
+    state.tiers.splice(to, 0, row);
+  });
+
+  refocusGrabbed();
+  announce("Tier " + (getTier(grab.id) || {}).name + ", row " + (to + 1) +
+           " of " + state.tiers.length);
+}
+
+/** Arrow keys walk between cards when nothing is held. */
+function stepFocus(fromId, delta) {
+  const order = allItemIds();
+  const at = order.indexOf(fromId);
+  if (at === -1) return;
+  const next = order[clamp(at + delta, 0, order.length - 1)];
+  if (next !== fromId) focusCard(next);
+}
+
+const ARROW_DELTA = {
+  ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1],
+};
+
+function onCardKeyDown(event, itemId) {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    openPanel(itemId);
+    return;
+  }
+  if (event.key === " " || event.key === "Spacebar") {
+    event.preventDefault();
+    toggleGrab("item", itemId);
+    return;
+  }
+
+  const delta = ARROW_DELTA[event.key];
+  if (!delta) return;
+  event.preventDefault();
+
+  const holding = runtime.grab && runtime.grab.kind === "item" && runtime.grab.id === itemId;
+  if (holding) moveGrabbedItem(delta[0], delta[1]);
+  else stepFocus(itemId, delta[0] || delta[1]);
+}
+
+function onGripKeyDown(event, tierId) {
+  if (event.key === " " || event.key === "Spacebar" || event.key === "Enter") {
+    event.preventDefault();
+    toggleGrab("tier", tierId);
+    return;
+  }
+
+  const delta = ARROW_DELTA[event.key];
+  if (!delta || delta[1] === 0) return;
+  if (!runtime.grab || runtime.grab.id !== tierId) return;
+  event.preventDefault();
+  moveGrabbedTier(delta[1]);
+}
+
+/* ==========================================================================
+   10. EVENTS
    ========================================================================== */
 
 /**
@@ -3075,6 +3666,20 @@ function newList() {
  * so focus is free to leave. Narrow ones have it float over the board, where
  * tabbing to something underneath it would be tabbing into nowhere.
  */
+/**
+ * Text fields keep their own undo stack; hijacking Ctrl+Z inside one would
+ * throw away a paragraph to undo a drag.
+ */
+function isUndoShortcut(event) {
+  if (!(event.ctrlKey || event.metaKey) || event.altKey) return false;
+  const key = event.key.toLowerCase();
+  if (key !== "z" && key !== "y") return false;
+
+  const active = document.activeElement;
+  const tag = active && active.tagName ? active.tagName.toLowerCase() : "";
+  return tag !== "input" && tag !== "textarea";
+}
+
 function isFileDrag(event) {
   const transfer = event.dataTransfer;
   return !!transfer && Array.prototype.includes.call(transfer.types || [], "Files");
@@ -3169,19 +3774,29 @@ function bindEvents() {
       trapTab(event);
       return;
     }
+    if (isUndoShortcut(event)) {
+      event.preventDefault();
+      const moved = event.shiftKey || event.key.toLowerCase() === "y" ? redo() : undo();
+      announce(moved
+        ? (event.shiftKey ? "Redone." : "Undone.")
+        : "Nothing left to " + (event.shiftKey ? "redo" : "undo") + ".");
+      return;
+    }
+
     if (event.key !== "Escape") return;
     if (runtime.drag) {
       releaseDragListeners();
       endDrag(false);
       return;
     }
+    if (cancelGrab()) return;
     if (clearPendingDelete()) return;
     if (runtime.panelOpen) closePanel();
   });
 }
 
 /* ==========================================================================
-   10. BOOT
+   11. BOOT
    ========================================================================== */
 
 async function boot() {
