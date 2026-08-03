@@ -190,9 +190,12 @@ items placed only via a temporary "move to tier" control that Phase 2 replaces.
 
 **Goal:** the core interaction.
 
-- Generic pointer drag engine: threshold before a drag starts (so clicks still register
-  as clicks), pointer capture, `touch-action: none` on drag handles, auto-cancel on
-  `pointercancel` and Escape.
+- Generic pointer drag engine, auto-cancelling on `pointercancel` and Escape. Starting
+  a drag differs by input device: a mouse needs a few pixels of travel (so clicks still
+  register as clicks), touch needs a ~400ms long press. The long press is what lets a
+  finger resting on a card still scroll the board — `touch-action: none` on cards would
+  have cost that, and cards cover most of the board. Once a touch drag is live the
+  engine calls `preventDefault` on `touchmove` to stop the page scrolling underneath it.
 - Floating drag layer: the dragged card is cloned into a fixed-position element that
   follows the pointer, tilted and shadowed; the original becomes a dimmed placeholder.
 - Drop targets: every tier's drop zone and the pool. Hit-testing by geometry against
