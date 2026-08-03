@@ -1,0 +1,1245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Tierlist</title>
+<style>
+/* ==========================================================================
+   TOKENS
+   ========================================================================== */
+
+:root {
+  color-scheme: dark light;
+
+  /* Surfaces, dark by default */
+  --bg:            #14161a;
+  --surface:       #1b1e24;
+  --surface-2:     #22262e;
+  --surface-3:     #2b303a;
+  --border:        #333945;
+  --border-strong: #454c5b;
+
+  /* Text */
+  --text:          #e8eaef;
+  --text-dim:      #a2a9b8;
+  --text-faint:    #6c7382;
+  --on-tier:       #14161a;   /* text drawn on top of a tier's colour */
+
+  --accent:        #6ea8fe;
+  --danger:        #f2637a;
+
+  /* Spacing scale */
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 24px;
+  --s6: 32px;
+
+  /* Radii */
+  --r1: 4px;
+  --r2: 8px;
+  --r3: 12px;
+
+  /* Shadows */
+  --shadow-1: 0 1px 2px rgb(0 0 0 / .3);
+  --shadow-2: 0 4px 16px rgb(0 0 0 / .35);
+  --shadow-3: 0 12px 40px rgb(0 0 0 / .45);
+
+  /* Metrics */
+  --tier-label-w: 108px;
+  --tier-min-h:   104px;
+  --card:         88px;       /* item card edge length */
+  --panel-w:      400px;
+  --header-h:     52px;
+
+  /* Motion */
+  --dur-fast: 90ms;
+  --dur:      160ms;
+  --dur-slow: 260ms;
+  --ease:     cubic-bezier(.2, .7, .3, 1);
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg:            #f4f5f7;
+    --surface:       #ffffff;
+    --surface-2:     #f0f1f4;
+    --surface-3:     #e4e6ec;
+    --border:        #dcdfe6;
+    --border-strong: #c3c8d4;
+
+    --text:          #1c1f26;
+    --text-dim:      #5c6474;
+    --text-faint:    #8d95a5;
+    --on-tier:       #14161a;
+
+    --accent:        #2f6fdd;
+    --danger:        #d33a55;
+
+    --shadow-1: 0 1px 2px rgb(16 20 30 / .08);
+    --shadow-2: 0 4px 16px rgb(16 20 30 / .10);
+    --shadow-3: 0 12px 40px rgb(16 20 30 / .16);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root { --dur-fast: 0ms; --dur: 0ms; --dur-slow: 0ms; }
+}
+
+/* ==========================================================================
+   BASE
+   ========================================================================== */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+        "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--r1);
+}
+
+/* ==========================================================================
+   APP SHELL
+   ========================================================================== */
+
+#app {
+  display: grid;
+  grid-template-rows: var(--header-h) 1fr;
+  height: 100%;
+}
+
+/* --- header --------------------------------------------------------------- */
+
+#header {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  padding: 0 var(--s4);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  z-index: 3;
+}
+
+#list-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+}
+
+.tool-btn {
+  padding: 6px 11px;
+  border-radius: var(--r1);
+  color: var(--text-dim);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  white-space: nowrap;
+  transition: background var(--dur-fast), color var(--dur-fast),
+              border-color var(--dur-fast);
+}
+.tool-btn:hover {
+  color: var(--text);
+  background: var(--surface-3);
+  border-color: var(--border-strong);
+}
+.tool-btn[disabled] {
+  opacity: .4;
+  cursor: default;
+}
+.tool-btn[disabled]:hover {
+  color: var(--text-dim);
+  background: var(--surface-2);
+  border-color: var(--border);
+}
+
+/* --- main: board + detail panel ------------------------------------------ */
+
+#main {
+  display: grid;
+  grid-template-columns: 1fr 0;
+  min-height: 0;
+  transition: grid-template-columns var(--dur-slow) var(--ease);
+}
+#main.panel-open { grid-template-columns: 1fr var(--panel-w); }
+
+#board-scroll {
+  min-width: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+#board {
+  padding: var(--s4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s5);
+  min-height: 100%;
+}
+
+/* ==========================================================================
+   TIERS
+   ========================================================================== */
+
+#tiers {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border-radius: var(--r2);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: var(--border);
+}
+
+.tier {
+  display: grid;
+  grid-template-columns: var(--tier-label-w) 1fr auto;
+  min-height: var(--tier-min-h);
+  background: var(--surface);
+}
+
+.tier-label {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: var(--s2);
+  background: var(--tier-color, var(--surface-3));
+  color: var(--on-tier);
+  text-align: center;
+  overflow: hidden;
+}
+
+.tier-name {
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: -.02em;
+  overflow-wrap: anywhere;
+  line-height: 1.15;
+}
+
+.tier-drop {
+  display: flex;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  gap: var(--s2);
+  padding: var(--s2);
+  background: var(--surface);
+}
+
+/* Per-tier controls. The column is always laid out, so fading it in on hover
+   never shifts the board; touch devices get it permanently. */
+.tier-tools {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--s1);
+  padding: var(--s2) 6px;
+  background: var(--surface);
+  opacity: 0;
+  transition: opacity var(--dur);
+}
+.tier:hover .tier-tools,
+.tier:focus-within .tier-tools { opacity: 1; }
+
+@media (hover: none) {
+  .tier-tools { opacity: 1; }
+}
+
+.tier-color {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  background: none;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r1);
+  cursor: pointer;
+}
+.tier-color::-webkit-color-swatch-wrapper { padding: 0; }
+.tier-color::-webkit-color-swatch { border: 0; border-radius: 3px; }
+.tier-color::-moz-color-swatch { border: 0; border-radius: 3px; }
+
+/* ==========================================================================
+   SHARED CONTROLS
+   ========================================================================== */
+
+.icon-btn {
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  flex: none;
+  border-radius: var(--r1);
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-faint);
+  font-size: 10px;
+  line-height: 1;
+  transition: color var(--dur-fast), background var(--dur-fast),
+              border-color var(--dur-fast);
+}
+.icon-btn:hover {
+  color: var(--text);
+  background: var(--surface-3);
+  border-color: var(--border-strong);
+}
+.icon-btn.danger:hover {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+/* Text that becomes an input on click. */
+.editable {
+  border-radius: var(--r1);
+  cursor: text;
+}
+.editable:hover { background: rgb(127 127 127 / .16); }
+
+.inline-input {
+  font: inherit;
+  color: inherit;
+  text-align: inherit;
+  width: 100%;
+  min-width: 0;
+  padding: 1px 4px;
+  border: 0;
+  border-radius: var(--r1);
+  background: rgb(127 127 127 / .22);
+  outline: none;
+}
+
+/* Two-step delete confirmation, drawn inside the tier's label cell. */
+.confirm-msg {
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+.confirm-sub {
+  font-size: 9px;
+  line-height: 1.2;
+  opacity: .75;
+}
+.confirm-row {
+  display: flex;
+  gap: var(--s1);
+}
+.confirm-btn {
+  padding: 3px 7px;
+  border-radius: var(--r1);
+  background: rgb(0 0 0 / .16);
+  color: var(--on-tier);
+  font-size: 10px;
+  font-weight: 600;
+}
+.confirm-btn:hover { background: rgb(0 0 0 / .30); }
+
+/* ==========================================================================
+   POOL
+   ========================================================================== */
+
+#pool-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+}
+
+.section-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+#pool-drop {
+  display: flex;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  gap: var(--s2);
+  padding: var(--s2);
+  min-height: var(--tier-min-h);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r2);
+}
+
+/* --- empty states --------------------------------------------------------- */
+
+.empty-hint {
+  align-self: center;
+  padding: 0 var(--s2);
+  color: var(--text-faint);
+  font-size: 12px;
+  user-select: none;
+}
+
+/* ==========================================================================
+   ITEM CARDS
+
+   A card is a short-description body with a name footer. Phase 5 swaps the
+   body for an image when the item's short type is "image".
+   ========================================================================== */
+
+.item {
+  position: relative;
+  width: var(--card);
+  height: var(--card);
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--r2);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  overflow: hidden;
+  user-select: none;
+}
+
+.item-body {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  place-items: center;
+  padding: var(--s2) 6px;
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.3;
+  text-align: center;
+  overflow: hidden;
+}
+.item-body > span {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+.item-body.is-empty { color: var(--text-faint); font-style: italic; }
+
+.item-name {
+  flex: none;
+  padding: 4px 6px;
+  background: var(--surface-3);
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  font-weight: 600;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.item-name.editable:hover { background: var(--border); }
+
+.item-tools {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  opacity: 0;
+  transition: opacity var(--dur);
+}
+.item:hover .item-tools,
+.item:focus-within .item-tools { opacity: 1; }
+
+@media (hover: none) {
+  .item-tools { opacity: 1; }
+}
+
+/* Temporary placement control — replaced by dragging in Phase 2. A native
+   <select> is used so keyboard and touch work with no extra code. */
+.item-move {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 20px;
+  height: 20px;
+  flex: none;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r1);
+  background: var(--surface-2);
+  color: transparent;      /* the chosen option's text must not show through */
+  font-size: 10px;
+  cursor: pointer;
+}
+.item-move::after { content: ""; }
+.item-move-wrap {
+  position: relative;
+  width: 20px;
+  height: 20px;
+  flex: none;
+}
+.item-move-wrap::after {
+  content: "⇢";
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: var(--text-faint);
+  font-size: 11px;
+  pointer-events: none;
+}
+.item-move-wrap:hover::after { color: var(--text); }
+.item-move:hover { background: var(--surface-3); border-color: var(--border-strong); }
+.item-move > option { color: var(--text); background: var(--surface); }
+
+.item-del.confirming {
+  width: auto;
+  padding: 0 6px;
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+  font-size: 9px;
+  font-weight: 600;
+}
+
+/* ==========================================================================
+   DETAIL PANEL
+   Present in the DOM from the start; contents land in Phase 4.
+   ========================================================================== */
+
+#panel {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  overflow: hidden;
+  transform: translateX(100%);
+  visibility: hidden;
+  transition: transform var(--dur-slow) var(--ease),
+              visibility var(--dur-slow);
+}
+#main.panel-open #panel {
+  transform: none;
+  visibility: visible;
+}
+
+#panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  height: var(--header-h);
+  padding: 0 var(--s3);
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+
+#panel-close {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--r1);
+  color: var(--text-dim);
+  font-size: 16px;
+  line-height: 1;
+}
+#panel-close:hover { color: var(--text); background: var(--surface-2); }
+
+#panel-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: var(--s5) var(--s4);
+  width: var(--panel-w);   /* keeps contents from reflowing during the slide */
+  max-width: 100%;
+}
+
+/* ==========================================================================
+   RESPONSIVE
+   Below the breakpoint the panel overlays the board instead of pushing it.
+   ========================================================================== */
+
+@media (max-width: 1100px) {
+  #main, #main.panel-open { grid-template-columns: 1fr 0; }
+  #panel {
+    position: fixed;
+    top: var(--header-h);
+    right: 0;
+    bottom: 0;
+    width: min(var(--panel-w), 100vw);
+    z-index: 4;
+    box-shadow: var(--shadow-3);
+  }
+}
+
+@media (max-width: 700px) {
+  :root {
+    --tier-label-w: 72px;
+    --tier-min-h: 88px;
+    --card: 72px;
+  }
+  #board { padding: var(--s3); gap: var(--s4); }
+  .tier-name { font-size: 17px; }
+  #header { padding: 0 var(--s3); gap: var(--s2); }
+  .tool-btn { padding: 6px 9px; }
+}
+</style>
+</head>
+<body>
+
+<div id="app">
+  <header id="header">
+    <div id="list-title"></div>
+    <nav id="toolbar"></nav>
+  </header>
+
+  <div id="main">
+    <div id="board-scroll">
+      <div id="board">
+        <div id="tiers"></div>
+        <section id="pool-section">
+          <div class="section-label">Unassigned</div>
+          <div id="pool-drop"></div>
+        </section>
+      </div>
+    </div>
+
+    <aside id="panel" aria-label="Item details" aria-hidden="true">
+      <div id="panel-head">
+        <button id="panel-close" type="button" title="Close (Esc)" aria-label="Close">✕</button>
+      </div>
+      <div id="panel-body"></div>
+    </aside>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+/* ==========================================================================
+   1. CONSTANTS
+   ========================================================================== */
+
+const SCHEMA_VERSION = 1;
+
+/* Conventional red -> green tier ramp. */
+const DEFAULT_TIERS = [
+  { name: "S", color: "#ff7f7f" },
+  { name: "A", color: "#ffbf7f" },
+  { name: "B", color: "#ffdf7f" },
+  { name: "C", color: "#bfff7f" },
+  { name: "D", color: "#7fffbf" },
+];
+
+/* Cycled through when a tier is added, continuing the ramp past D. */
+const TIER_PALETTE = [
+  "#7fdfff", "#9fbfff", "#bf9fff", "#ff9fdf", "#c9c9c9",
+];
+
+const DEFAULT_TIER_NAME = "New";
+const DEFAULT_ITEM_NAME = "Untitled";
+
+/* ==========================================================================
+   2. STATE
+
+   `state` is the serializable document and matches the export schema exactly.
+   `runtime` is everything that must never be written to a file: image blobs,
+   object URLs, selection, transient UI flags.
+   ========================================================================== */
+
+let state = createEmptyDocument();
+
+const runtime = {
+  /** imagePath -> { blob, url, filename, mime, width, height } */
+  images: new Map(),
+  selectedItemId: null,
+  panelOpen: false,
+  /** true when the document has changed since the last export */
+  dirty: false,
+  /** armed two-step delete, e.g. "tier:tier_ab12" or "item:item_cd34" */
+  pendingDelete: null,
+};
+
+function createEmptyDocument() {
+  const now = new Date().toISOString();
+  return {
+    schema: SCHEMA_VERSION,
+    app: "tierlist",
+    title: "Untitled Tier List",
+    createdAt: now,
+    modifiedAt: now,
+    tiers: DEFAULT_TIERS.map(t => ({
+      id: newId("tier"),
+      name: t.name,
+      color: t.color,
+      items: [],
+    })),
+    pool: [],
+    items: {},
+    images: {},
+  };
+}
+
+/* --- ids ------------------------------------------------------------------ */
+
+/**
+ * Short, collision-resistant enough for a single document. Not a UUID on
+ * purpose: these end up inside the exported JSON and in archive filenames,
+ * where being readable matters more than being globally unique.
+ */
+function newId(prefix) {
+  const bytes = crypto.getRandomValues(new Uint8Array(6));
+  let out = "";
+  for (const b of bytes) out += b.toString(36).padStart(2, "0");
+  return prefix + "_" + out;
+}
+
+/* --- mutation funnel ------------------------------------------------------ */
+
+/**
+ * The single entry point for changing the document. Everything goes through
+ * here so that undo/redo (Phase 8) and autosave (Phase 7) have exactly one
+ * seam to hook, rather than needing to chase down every mutation site.
+ *
+ * @param {() => void} mutate     performs the change against `state`
+ * @param {object}     [opts]
+ * @param {boolean}    [opts.silent]  skip the re-render (caller will do it)
+ */
+function commit(mutate, opts = {}) {
+  // Phase 8: push a snapshot onto the undo stack here, before mutating.
+  mutate();
+  state.modifiedAt = new Date().toISOString();
+  runtime.dirty = true;
+  // Phase 7: schedule a debounced autosave here.
+  if (!opts.silent) render();
+}
+
+/* --- lookups -------------------------------------------------------------- */
+
+function getItem(id) {
+  return state.items[id] || null;
+}
+
+function getTier(id) {
+  return state.tiers.find(t => t.id === id) || null;
+}
+
+/** Every item id on the board, tiers first then the pool, in visual order. */
+function allItemIds() {
+  const ids = [];
+  for (const tier of state.tiers) ids.push(...tier.items);
+  ids.push(...state.pool);
+  return ids;
+}
+
+/**
+ * Finds the list an item currently sits in.
+ * @returns {{ list: string[], index: number, tier: object|null } | null}
+ */
+function locateItem(id) {
+  for (const tier of state.tiers) {
+    const index = tier.items.indexOf(id);
+    if (index !== -1) return { list: tier.items, index, tier };
+  }
+  const index = state.pool.indexOf(id);
+  if (index !== -1) return { list: state.pool, index, tier: null };
+  return null;
+}
+
+/* ==========================================================================
+   3. DOM HELPERS
+   ==========================================================================
+
+   Elements are built rather than assembled from HTML strings, so user text
+   can never be interpreted as markup. */
+
+const $ = sel => document.querySelector(sel);
+
+function el(tag, props = {}, children = []) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(props)) {
+    if (value == null || value === false) continue;
+    if (key === "class") node.className = value;
+    else if (key === "text") node.textContent = value;
+    else if (key === "style") applyStyle(node, value);
+    else if (key === "dataset") Object.assign(node.dataset, value);
+    else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
+    else node.setAttribute(key, value === true ? "" : value);
+  }
+  for (const child of [].concat(children)) {
+    if (child == null || child === false) continue;
+    node.append(child);
+  }
+  return node;
+}
+
+/** Custom properties need setProperty — assigning to style[key] drops them. */
+function applyStyle(node, styles) {
+  for (const [key, value] of Object.entries(styles)) {
+    if (key.startsWith("--")) node.style.setProperty(key, value);
+    else node.style[key] = value;
+  }
+}
+
+function clear(node) {
+  while (node.firstChild) node.removeChild(node.firstChild);
+}
+
+/**
+ * Swaps a text element's contents for an input. Enter or blur commits, Escape
+ * reverts. Shared by the list title, tier names and item names.
+ */
+function startRename(target, current, onCommit) {
+  if (target.dataset.editing) return;
+  target.dataset.editing = "1";
+
+  const input = el("input", {
+    class: "inline-input",
+    type: "text",
+    value: current,
+    "aria-label": "Name",
+  });
+  target.replaceChildren(input);
+  input.focus();
+  input.select();
+
+  let settled = false;
+  const finish = save => {
+    if (settled) return;
+    settled = true;
+    delete target.dataset.editing;
+    const next = input.value.trim();
+    if (save && next && next !== current) onCommit(next);
+    else render();
+  };
+
+  input.addEventListener("keydown", event => {
+    // Escape must not reach the document handler and close the panel too.
+    event.stopPropagation();
+    if (event.key === "Enter") { event.preventDefault(); finish(true); }
+    else if (event.key === "Escape") { event.preventDefault(); finish(false); }
+  });
+  input.addEventListener("blur", () => finish(true));
+}
+
+/* ==========================================================================
+   4. ACTIONS
+
+   Every document mutation lives here and routes through commit().
+   ========================================================================== */
+
+function setTitle(title) {
+  commit(() => { state.title = title; });
+}
+
+/* --- tiers ---------------------------------------------------------------- */
+
+function addTier() {
+  commit(() => {
+    state.tiers.push({
+      id: newId("tier"),
+      name: DEFAULT_TIER_NAME,
+      color: TIER_PALETTE[state.tiers.length % TIER_PALETTE.length],
+      items: [],
+    });
+  });
+}
+
+function renameTier(id, name) {
+  commit(() => { const tier = getTier(id); if (tier) tier.name = name; });
+}
+
+function recolorTier(id, color) {
+  commit(() => { const tier = getTier(id); if (tier) tier.color = color; });
+}
+
+/** Items outlive their tier — deleting a row returns its contents to the pool. */
+function deleteTier(id) {
+  commit(() => {
+    const index = state.tiers.findIndex(tier => tier.id === id);
+    if (index === -1) return;
+    state.pool.push(...state.tiers[index].items);
+    state.tiers.splice(index, 1);
+  });
+}
+
+/* --- items ---------------------------------------------------------------- */
+
+function addItem() {
+  const id = newId("item");
+  commit(() => {
+    state.items[id] = {
+      id,
+      name: DEFAULT_ITEM_NAME + " " + (Object.keys(state.items).length + 1),
+      shortType: "text",
+      shortText: "",
+      image: null,
+      description: "",
+      accent: null,
+    };
+    state.pool.push(id);
+  });
+  return id;
+}
+
+function renameItem(id, name) {
+  commit(() => { const item = getItem(id); if (item) item.name = name; });
+}
+
+function deleteItem(id) {
+  commit(() => {
+    const loc = locateItem(id);
+    if (loc) loc.list.splice(loc.index, 1);
+    delete state.items[id];
+    // Phase 5: release the item's image if no other item references it.
+  });
+  if (runtime.selectedItemId === id) closePanel();
+}
+
+/**
+ * Appends an item to the end of a destination list.
+ * @param {string} dest  a tier id, or "pool"
+ */
+function moveItem(id, dest) {
+  commit(() => {
+    const loc = locateItem(id);
+    if (!loc) return;
+    loc.list.splice(loc.index, 1);
+    const tier = dest === "pool" ? null : getTier(dest);
+    (tier ? tier.items : state.pool).push(id);
+  });
+}
+
+/* --- two-step delete ------------------------------------------------------ */
+
+function armDelete(key) {
+  runtime.pendingDelete = key;
+  render();
+}
+
+/** @returns {boolean} whether anything was armed */
+function clearPendingDelete() {
+  if (!runtime.pendingDelete) return false;
+  runtime.pendingDelete = null;
+  render();
+  return true;
+}
+
+/* ==========================================================================
+   5. RENDER
+
+   The whole board is rebuilt on every commit. That is fine at this size;
+   Phase 4 introduces targeted card updates once typing in the detail panel
+   makes full re-renders wasteful.
+   ========================================================================== */
+
+const dom = {};
+
+function cacheDom() {
+  dom.main       = $("#main");
+  dom.title      = $("#list-title");
+  dom.toolbar    = $("#toolbar");
+  dom.tiers      = $("#tiers");
+  dom.poolDrop   = $("#pool-drop");
+  dom.panel      = $("#panel");
+  dom.panelBody  = $("#panel-body");
+  dom.panelClose = $("#panel-close");
+}
+
+function render() {
+  renderHeader();
+  renderTiers();
+  renderPool();
+  renderPanel();
+}
+
+/* --- header --------------------------------------------------------------- */
+
+function renderHeader() {
+  if (!dom.title.dataset.editing) dom.title.textContent = state.title;
+
+  clear(dom.toolbar);
+  // Phase 6 adds import/export here.
+  dom.toolbar.append(
+    el("button", { class: "tool-btn", type: "button", text: "Add item", onclick: () => addItem() }),
+    el("button", { class: "tool-btn", type: "button", text: "Add tier", onclick: addTier }),
+  );
+}
+
+/* --- tiers ---------------------------------------------------------------- */
+
+function renderTiers() {
+  clear(dom.tiers);
+  for (const tier of state.tiers) {
+    dom.tiers.append(renderTier(tier));
+  }
+}
+
+function renderTier(tier) {
+  const confirming = runtime.pendingDelete === "tier:" + tier.id;
+
+  const label = el("div", {
+    class: "tier-label",
+    style: { "--tier-color": tier.color },
+  }, confirming ? renderTierConfirm(tier) : [
+    el("div", {
+      class: "tier-name editable",
+      text: tier.name,
+      title: "Click to rename",
+      onclick: event => startRename(
+        event.currentTarget, tier.name, name => renameTier(tier.id, name)),
+    }),
+  ]);
+
+  const drop = el("div", {
+    class: "tier-drop",
+    dataset: { dropZone: "tier", tierId: tier.id },
+  });
+
+  if (tier.items.length === 0) {
+    drop.append(el("div", { class: "empty-hint", text: "Empty" }));
+  } else {
+    for (const id of tier.items) {
+      const item = getItem(id);
+      if (item) drop.append(renderItem(item));
+    }
+  }
+
+  const tools = el("div", { class: "tier-tools" }, [
+    // Phase 3 adds the drag handle above these.
+    el("input", {
+      class: "tier-color",
+      type: "color",
+      value: tier.color,
+      title: "Tier colour",
+      onchange: event => recolorTier(tier.id, event.target.value),
+    }),
+    el("button", {
+      class: "icon-btn danger",
+      type: "button",
+      text: "✕",
+      title: "Delete tier",
+      onclick: () => armDelete("tier:" + tier.id),
+    }),
+  ]);
+
+  return el("div", {
+    class: "tier",
+    dataset: { tierId: tier.id },
+  }, [label, drop, tools]);
+}
+
+/** Confirmation drawn into the tier's label cell, which has room for words. */
+function renderTierConfirm(tier) {
+  const count = tier.items.length;
+  return [
+    el("div", { class: "confirm-msg", text: "Delete tier?" }),
+    count > 0 && el("div", {
+      class: "confirm-sub",
+      text: count + (count === 1 ? " item" : " items") + " → Unassigned",
+    }),
+    el("div", { class: "confirm-row" }, [
+      el("button", {
+        class: "confirm-btn", type: "button", text: "Delete",
+        onclick: () => { runtime.pendingDelete = null; deleteTier(tier.id); },
+      }),
+      el("button", {
+        class: "confirm-btn", type: "button", text: "Cancel",
+        onclick: clearPendingDelete,
+      }),
+    ]),
+  ];
+}
+
+/* --- pool ----------------------------------------------------------------- */
+
+function renderPool() {
+  clear(dom.poolDrop);
+  dom.poolDrop.dataset.dropZone = "pool";
+
+  if (state.pool.length === 0) {
+    dom.poolDrop.append(el("div", {
+      class: "empty-hint",
+      text: "Unranked items collect here.",
+    }));
+    return;
+  }
+
+  for (const id of state.pool) {
+    const item = getItem(id);
+    if (item) dom.poolDrop.append(renderItem(item));
+  }
+}
+
+/* --- item cards ----------------------------------------------------------- */
+
+function renderItem(item) {
+  const confirming = runtime.pendingDelete === "item:" + item.id;
+  const short = (item.shortText || "").trim();
+  const hasShort = item.shortType === "text" && short !== "";
+
+  // Phase 5 branches here on item.shortType === "image".
+  const body = el("div", {
+    class: "item-body" + (hasShort ? "" : " is-empty"),
+  }, [
+    el("span", { text: hasShort ? short : "—" }),
+  ]);
+
+  const name = el("div", {
+    class: "item-name editable",
+    text: item.name,
+    title: item.name + " — click to rename",
+    onclick: event => startRename(
+      event.currentTarget, item.name, next => renameItem(item.id, next)),
+  });
+
+  const tools = el("div", { class: "item-tools" }, [
+    !confirming && renderMoveControl(item),
+    el("button", {
+      class: "icon-btn danger item-del" + (confirming ? " confirming" : ""),
+      type: "button",
+      text: confirming ? "Delete?" : "✕",
+      title: confirming ? "Click again to delete" : "Delete item",
+      onclick: () => {
+        if (!confirming) return armDelete("item:" + item.id);
+        runtime.pendingDelete = null;
+        deleteItem(item.id);
+      },
+    }),
+  ]);
+
+  return el("div", {
+    class: "item",
+    dataset: { itemId: item.id },
+  }, [tools, body, name]);
+}
+
+/**
+ * Temporary placement control. Phase 2 removes this entirely — it exists only
+ * so items can reach a tier before dragging works.
+ */
+function renderMoveControl(item) {
+  const loc = locateItem(item.id);
+  const current = loc && loc.tier ? loc.tier.id : "pool";
+
+  const options = state.tiers.map(tier => el("option", {
+    value: tier.id,
+    text: tier.name || "(unnamed)",
+    selected: tier.id === current,
+  }));
+  options.push(el("option", {
+    value: "pool",
+    text: "Unassigned",
+    selected: current === "pool",
+  }));
+
+  return el("div", { class: "item-move-wrap" }, [
+    el("select", {
+      class: "item-move",
+      title: "Move to…",
+      "aria-label": "Move " + item.name + " to",
+      onchange: event => moveItem(item.id, event.target.value),
+    }, options),
+  ]);
+}
+
+/* --- detail panel --------------------------------------------------------- */
+
+function renderPanel() {
+  const open = runtime.panelOpen && runtime.selectedItemId != null;
+  dom.main.classList.toggle("panel-open", open);
+  dom.panel.setAttribute("aria-hidden", open ? "false" : "true");
+
+  clear(dom.panelBody);
+  if (!open) return;
+
+  // Phase 4 builds the real editing surface here.
+  const item = getItem(runtime.selectedItemId);
+  if (item) dom.panelBody.append(el("div", { text: item.name }));
+}
+
+function openPanel(itemId) {
+  runtime.selectedItemId = itemId;
+  runtime.panelOpen = true;
+  renderPanel();
+}
+
+function closePanel() {
+  runtime.panelOpen = false;
+  renderPanel();
+}
+
+/* ==========================================================================
+   6. EVENTS
+   ========================================================================== */
+
+function bindEvents() {
+  dom.panelClose.addEventListener("click", closePanel);
+
+  dom.title.classList.add("editable");
+  dom.title.title = "Click to rename";
+  dom.title.addEventListener("click", () => {
+    startRename(dom.title, state.title, setTitle);
+  });
+
+  // Disarm a pending delete when attention moves elsewhere. This listens for
+  // click rather than pointerdown so the clicked control's own handler runs
+  // first — re-rendering on pointerdown would detach it mid-gesture.
+  document.addEventListener("click", event => {
+    if (!runtime.pendingDelete) return;
+    if (event.target.closest(".confirming, .confirm-row, .icon-btn.danger")) return;
+    clearPendingDelete();
+  });
+
+  document.addEventListener("keydown", event => {
+    if (event.key !== "Escape") return;
+    if (clearPendingDelete()) return;
+    if (runtime.panelOpen) closePanel();
+  });
+}
+
+/* ==========================================================================
+   7. BOOT
+   ========================================================================== */
+
+function boot() {
+  cacheDom();
+  bindEvents();
+  // Phase 7 restores a persisted session here before the first render.
+  render();
+}
+
+boot();
+</script>
+</body>
+</html>
