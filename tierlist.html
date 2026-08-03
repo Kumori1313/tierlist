@@ -129,8 +129,44 @@ button {
 
 #app {
   display: grid;
-  grid-template-rows: var(--header-h) 1fr;
+  grid-template-rows: var(--header-h) auto 1fr;
   height: 100%;
+}
+
+/* --- banner --------------------------------------------------------------- */
+
+#banner {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  padding: var(--s2) var(--s4);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-dim);
+  font-size: 12px;
+  z-index: 2;
+}
+#banner[hidden] { display: none; }
+#banner.tone-warn {
+  border-bottom-color: var(--danger);
+  color: var(--text);
+}
+#banner.tone-warn::before {
+  content: "";
+  width: 3px;
+  align-self: stretch;
+  flex: none;
+  border-radius: 2px;
+  background: var(--danger);
+}
+
+.banner-text { flex: 1; min-width: 0; }
+
+.banner-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  flex: none;
 }
 
 /* --- header --------------------------------------------------------------- */
@@ -889,6 +925,8 @@ body.is-dragging .editable:hover { background: none; cursor: grabbing; }
     <nav id="toolbar"></nav>
   </header>
 
+  <div id="banner" hidden></div>
+
   <div id="main">
     <div id="board-scroll">
       <div id="board">
@@ -977,6 +1015,8 @@ const runtime = {
   drag: null,
   /** inline message shown in the detail panel, e.g. a rejected file */
   panelError: null,
+  /** the notice strip under the header, see showBanner */
+  banner: null,
 };
 
 function createEmptyDocument() {
@@ -1413,6 +1453,7 @@ const dom = {};
 
 function cacheDom() {
   dom.main       = $("#main");
+  dom.banner     = $("#banner");
   dom.boardScroll = $("#board-scroll");
   dom.dragLayer  = $("#drag-layer");
   dom.title      = $("#list-title");
@@ -1426,6 +1467,7 @@ function cacheDom() {
 
 function render() {
   renderHeader();
+  renderBanner();
   renderTiers();
   renderPool();
   renderPanel();
@@ -1437,11 +1479,52 @@ function renderHeader() {
   if (!dom.title.dataset.editing) dom.title.textContent = state.title;
 
   clear(dom.toolbar);
-  // Phase 6 adds import/export here.
+
+  const picker = el("input", {
+    type: "file",
+    class: "visually-hidden",
+    accept: ".tierlist,.zip,application/zip",
+    onchange: event => {
+      const file = event.target.files[0];
+      if (file) requestImport(file);
+      event.target.value = "";     // picking the same file twice must re-fire
+    },
+  });
+
   dom.toolbar.append(
     el("button", { class: "tool-btn", type: "button", text: "Add item", onclick: () => addItem() }),
     el("button", { class: "tool-btn", type: "button", text: "Add tier", onclick: addTier }),
+    picker,
+    el("button", {
+      class: "tool-btn", type: "button", text: "Open", title: "Open a .tierlist file",
+      onclick: () => picker.click(),
+    }),
+    el("button", {
+      class: "tool-btn", type: "button", text: "Save", title: "Download this list as a .tierlist file",
+      onclick: exportList,
+    }),
   );
+}
+
+function renderBanner() {
+  const banner = runtime.banner;
+  clear(dom.banner);
+  dom.banner.hidden = !banner;
+  if (!banner) return;
+
+  dom.banner.className = "tone-" + (banner.tone || "info");
+  dom.banner.append(el("div", { class: "banner-text", text: banner.text }));
+
+  const actions = el("div", { class: "banner-actions" });
+  for (const action of banner.actions || []) {
+    actions.append(el("button", {
+      class: "tool-btn", type: "button", text: action.label, onclick: action.onClick,
+    }));
+  }
+  actions.append(el("button", {
+    class: "icon-btn", type: "button", text: "✕", title: "Dismiss", onclick: dismissBanner,
+  }));
+  dom.banner.append(actions);
 }
 
 /* --- tiers ---------------------------------------------------------------- */
@@ -1754,6 +1837,7 @@ function renderImageEditor(item) {
     ondragleave: event => event.currentTarget.classList.remove("is-over"),
     ondrop: event => {
       event.preventDefault();
+      event.stopPropagation();   // not an archive drop, see the window handler
       event.currentTarget.classList.remove("is-over");
       const file = event.dataTransfer.files[0];
       if (file) attachImage(item.id, file);
@@ -2201,7 +2285,551 @@ function swallowNextClick() {
 }
 
 /* ==========================================================================
-   7. EVENTS
+   7. ARCHIVE
+
+   Export and import, with a hand-written ZIP so the page stays dependency
+   free. The format needed here is small: a local header per file, a central
+   directory, and an end-of-central-directory record. Compression is native —
+   CompressionStream('deflate-raw') — and falls back to storing when a browser
+   lacks it, which stays a perfectly valid ZIP.
+
+   Reading parses the central directory rather than walking local headers, so
+   archives produced by other tools load too.
+   ========================================================================== */
+
+const MANIFEST_NAME = "tierlist.json";
+const ZIP_SIG_LOCAL = 0x04034b50;
+const ZIP_SIG_CENTRAL = 0x02014b50;
+const ZIP_SIG_EOCD = 0x06054b50;
+
+/* --- crc32 ---------------------------------------------------------------- */
+
+let crcTable = null;
+
+function crc32(bytes) {
+  if (!crcTable) {
+    crcTable = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+      let c = i;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+      crcTable[i] = c >>> 0;
+    }
+  }
+  let crc = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) {
+    crc = crcTable[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+/* --- deflate -------------------------------------------------------------- */
+
+function hasCompressionStreams() {
+  return typeof CompressionStream === "function" &&
+         typeof DecompressionStream === "function";
+}
+
+async function pipeThrough(bytes, transform) {
+  const stream = new Blob([bytes]).stream().pipeThrough(transform);
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+const deflateRaw = bytes => pipeThrough(bytes, new CompressionStream("deflate-raw"));
+const inflateRaw = bytes => pipeThrough(bytes, new DecompressionStream("deflate-raw"));
+
+/* --- writing -------------------------------------------------------------- */
+
+/** DOS packs a timestamp into two 16-bit words, with two-second resolution. */
+function dosDateTime(date) {
+  const year = Math.max(1980, date.getFullYear());
+  return {
+    time: (date.getHours() << 11) | (date.getMinutes() << 5) | (date.getSeconds() >> 1),
+    date: ((year - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate(),
+  };
+}
+
+/**
+ * @param {{name: string, data: Uint8Array, compress?: boolean}[]} entries
+ * @returns {Promise<Uint8Array>} the complete archive
+ */
+async function buildZip(entries) {
+  const encoder = new TextEncoder();
+  const stamp = dosDateTime(new Date());
+  const parts = [];
+  const directory = [];
+  let offset = 0;
+
+  for (const entry of entries) {
+    const nameBytes = encoder.encode(entry.name);
+    const crc = crc32(entry.data);
+
+    let method = 0;
+    let payload = entry.data;
+    // Images are already compressed formats; deflating them wastes time for
+    // a fraction of a percent. Only the manifest asks for it.
+    if (entry.compress && hasCompressionStreams()) {
+      const deflated = await deflateRaw(entry.data);
+      if (deflated.length < entry.data.length) {
+        method = 8;
+        payload = deflated;
+      }
+    }
+
+    const local = new Uint8Array(30 + nameBytes.length);
+    const lv = new DataView(local.buffer);
+    lv.setUint32(0, ZIP_SIG_LOCAL, true);
+    lv.setUint16(4, 20, true);            // version needed
+    lv.setUint16(6, 0x0800, true);        // flags: names are UTF-8
+    lv.setUint16(8, method, true);
+    lv.setUint16(10, stamp.time, true);
+    lv.setUint16(12, stamp.date, true);
+    lv.setUint32(14, crc, true);
+    lv.setUint32(18, payload.length, true);
+    lv.setUint32(22, entry.data.length, true);
+    lv.setUint16(26, nameBytes.length, true);
+    lv.setUint16(28, 0, true);            // no extra field
+    local.set(nameBytes, 30);
+
+    const central = new Uint8Array(46 + nameBytes.length);
+    const cv = new DataView(central.buffer);
+    cv.setUint32(0, ZIP_SIG_CENTRAL, true);
+    cv.setUint16(4, 20, true);            // version made by
+    cv.setUint16(6, 20, true);            // version needed
+    cv.setUint16(8, 0x0800, true);
+    cv.setUint16(10, method, true);
+    cv.setUint16(12, stamp.time, true);
+    cv.setUint16(14, stamp.date, true);
+    cv.setUint32(16, crc, true);
+    cv.setUint32(20, payload.length, true);
+    cv.setUint32(24, entry.data.length, true);
+    cv.setUint16(28, nameBytes.length, true);
+    cv.setUint16(30, 0, true);            // extra
+    cv.setUint16(32, 0, true);            // comment
+    cv.setUint16(34, 0, true);            // disk number
+    cv.setUint16(36, 0, true);            // internal attrs
+    cv.setUint32(38, 0, true);            // external attrs
+    cv.setUint32(42, offset, true);
+    central.set(nameBytes, 46);
+
+    parts.push(local, payload);
+    directory.push(central);
+    offset += local.length + payload.length;
+
+    if (offset > 0xffffffff) {
+      throw new Error("This list is too large to save as a ZIP archive.");
+    }
+  }
+
+  const directorySize = directory.reduce((sum, part) => sum + part.length, 0);
+  const eocd = new Uint8Array(22);
+  const ev = new DataView(eocd.buffer);
+  ev.setUint32(0, ZIP_SIG_EOCD, true);
+  ev.setUint16(4, 0, true);
+  ev.setUint16(6, 0, true);
+  ev.setUint16(8, entries.length, true);
+  ev.setUint16(10, entries.length, true);
+  ev.setUint32(12, directorySize, true);
+  ev.setUint32(16, offset, true);
+  ev.setUint16(20, 0, true);              // no archive comment
+
+  const all = [...parts, ...directory, eocd];
+  const total = all.reduce((sum, part) => sum + part.length, 0);
+  const out = new Uint8Array(total);
+  let cursor = 0;
+  for (const part of all) {
+    out.set(part, cursor);
+    cursor += part.length;
+  }
+  return out;
+}
+
+/* --- reading -------------------------------------------------------------- */
+
+/**
+ * @param {Uint8Array} bytes
+ * @returns {Map<string, {method: number, raw: Uint8Array, size: number}>}
+ */
+function readZip(bytes) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+
+  // The EOCD sits at the end, but a trailing comment can push it back by up
+  // to 64K, so scan backwards for the signature.
+  let eocd = -1;
+  const floor = Math.max(0, bytes.length - (22 + 0xffff));
+  for (let i = bytes.length - 22; i >= floor; i--) {
+    if (view.getUint32(i, true) === ZIP_SIG_EOCD) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error("That file is not a ZIP archive.");
+
+  const count = view.getUint16(eocd + 10, true);
+  let ptr = view.getUint32(eocd + 16, true);
+
+  const decoder = new TextDecoder();
+  const files = new Map();
+
+  for (let i = 0; i < count; i++) {
+    if (ptr + 46 > bytes.length || view.getUint32(ptr, true) !== ZIP_SIG_CENTRAL) {
+      throw new Error("This archive's directory is damaged.");
+    }
+    const method = view.getUint16(ptr + 10, true);
+    const compressedSize = view.getUint32(ptr + 20, true);
+    const size = view.getUint32(ptr + 24, true);
+    const nameLength = view.getUint16(ptr + 28, true);
+    const extraLength = view.getUint16(ptr + 30, true);
+    const commentLength = view.getUint16(ptr + 32, true);
+    const localOffset = view.getUint32(ptr + 42, true);
+
+    let name = decoder.decode(bytes.subarray(ptr + 46, ptr + 46 + nameLength));
+    if (name.startsWith("./")) name = name.slice(2);
+
+    // The local header repeats the name and extra fields, and other writers
+    // pad them differently — read the real lengths rather than assuming ours.
+    if (view.getUint32(localOffset, true) !== ZIP_SIG_LOCAL) {
+      throw new Error("This archive's file headers are damaged.");
+    }
+    const localNameLength = view.getUint16(localOffset + 26, true);
+    const localExtraLength = view.getUint16(localOffset + 28, true);
+    const start = localOffset + 30 + localNameLength + localExtraLength;
+
+    if (!name.endsWith("/")) {
+      files.set(name, {
+        method,
+        size,
+        raw: bytes.subarray(start, start + compressedSize),
+      });
+    }
+    ptr += 46 + nameLength + extraLength + commentLength;
+  }
+
+  return files;
+}
+
+async function unpack(entry) {
+  if (entry.method === 0) return entry.raw;
+  if (entry.method === 8) {
+    if (!hasCompressionStreams()) {
+      throw new Error("This browser cannot decompress that archive.");
+    }
+    return inflateRaw(entry.raw);
+  }
+  throw new Error("Unsupported compression in this archive (method " + entry.method + ").");
+}
+
+/* --- export --------------------------------------------------------------- */
+
+/**
+ * The document as it should be written. Images are kept when some item names
+ * them, whether or not that item is currently in image mode — a retained
+ * image must survive the round trip.
+ */
+function serializeDocument() {
+  const referenced = new Set();
+  for (const item of Object.values(state.items)) {
+    if (item.image) referenced.add(item.image);
+  }
+
+  const images = {};
+  for (const [path, meta] of Object.entries(state.images)) {
+    if (referenced.has(path) && runtime.images.has(path)) images[path] = meta;
+  }
+
+  return {
+    ...state,
+    schema: SCHEMA_VERSION,
+    app: "tierlist",
+    modifiedAt: new Date().toISOString(),
+    images,
+  };
+}
+
+function slugify(text) {
+  const slug = (text || "").toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60);
+  return slug || "tierlist";
+}
+
+async function buildArchiveBytes() {
+  const manifest = serializeDocument();
+  const encoder = new TextEncoder();
+
+  const entries = [{
+    name: MANIFEST_NAME,
+    data: encoder.encode(JSON.stringify(manifest, null, 2)),
+    compress: true,
+  }];
+
+  for (const path of Object.keys(manifest.images)) {
+    const held = runtime.images.get(path);
+    const buffer = await held.blob.arrayBuffer();
+    entries.push({ name: path, data: new Uint8Array(buffer), compress: false });
+  }
+
+  return buildZip(entries);
+}
+
+async function exportList() {
+  try {
+    const bytes = await buildArchiveBytes();
+    downloadBlob(new Blob([bytes], { type: "application/zip" }),
+                 slugify(state.title) + ".tierlist");
+    runtime.dirty = false;
+  } catch (error) {
+    showBanner({ tone: "warn", text: "Could not save: " + error.message });
+  }
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const link = el("a", { href: url, download: filename });
+  document.body.append(link);
+  link.click();
+  link.remove();
+  // Give the browser a moment to start the download before pulling the URL.
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+/* --- import --------------------------------------------------------------- */
+
+const asString = (value, fallback) => typeof value === "string" ? value : fallback;
+
+/**
+ * Turns whatever was in the archive into a document this app can render.
+ *
+ * Repairs rather than rejects wherever the intent is recoverable: duplicate
+ * placements, items that belong to no list, references to items that no longer
+ * exist, images the archive is missing. Only an unreadable manifest is fatal.
+ *
+ * @returns {{doc: object, images: Map, notes: string[]}}
+ */
+async function adoptArchive(manifest, files) {
+  const notes = [];
+
+  if (typeof manifest !== "object" || manifest === null) {
+    throw new Error("The manifest in that archive is not valid JSON.");
+  }
+  if (typeof manifest.schema === "number" && manifest.schema > SCHEMA_VERSION) {
+    throw new Error("That list was saved by a newer version of this app.");
+  }
+  // Older schemas would be migrated here; version 1 is the only one so far.
+
+  const rawItems = (manifest.items && typeof manifest.items === "object") ? manifest.items : {};
+  const rawImages = (manifest.images && typeof manifest.images === "object") ? manifest.images : {};
+
+  /* items ------------------------------------------------------------------ */
+
+  const items = {};
+  for (const [id, raw] of Object.entries(rawItems)) {
+    if (!raw || typeof raw !== "object") continue;
+    const shortType = raw.shortType === "image" ? "image" : "text";
+    items[id] = {
+      id,
+      name: asString(raw.name, DEFAULT_ITEM_NAME),
+      shortType,
+      shortText: asString(raw.shortText, ""),
+      image: asString(raw.image, null),
+      description: asString(raw.description, ""),
+      accent: asString(raw.accent, null),
+    };
+  }
+
+  /* images ----------------------------------------------------------------- */
+
+  const images = new Map();
+  const keptImages = {};
+  let missing = 0;
+
+  for (const item of Object.values(items)) {
+    if (!item.image) continue;
+
+    const entry = files.get(item.image);
+    if (!entry) {
+      // The manifest points at a file the archive does not contain. Keep the
+      // item, drop the picture, say so.
+      if (item.shortType === "image") item.shortType = "text";
+      item.image = null;
+      missing++;
+      continue;
+    }
+
+    if (!images.has(item.image)) {
+      const meta = rawImages[item.image] || {};
+      const bytes = await unpack(entry);
+      const mime = asString(meta.mime, "application/octet-stream");
+      const blob = new Blob([bytes], { type: mime });
+
+      images.set(item.image, {
+        blob,
+        url: URL.createObjectURL(blob),
+        filename: asString(meta.filename, item.image),
+        mime,
+        width: Number(meta.width) || 0,
+        height: Number(meta.height) || 0,
+      });
+      keptImages[item.image] = {
+        filename: asString(meta.filename, item.image),
+        mime,
+        bytes: bytes.length,
+        width: Number(meta.width) || 0,
+        height: Number(meta.height) || 0,
+      };
+    }
+  }
+
+  if (missing > 0) {
+    notes.push(missing === 1
+      ? "1 image was missing from the archive; that item fell back to text."
+      : missing + " images were missing from the archive; those items fell back to text.");
+  }
+
+  const orphanImages = Object.keys(rawImages).length - Object.keys(keptImages).length;
+  if (orphanImages > 0) {
+    notes.push(orphanImages === 1
+      ? "1 unused image was dropped."
+      : orphanImages + " unused images were dropped.");
+  }
+
+  /* placements ------------------------------------------------------------- */
+
+  const placed = new Set();
+  let duplicates = 0;
+  let unknown = 0;
+
+  const cleanList = list => {
+    const out = [];
+    for (const id of Array.isArray(list) ? list : []) {
+      if (!items[id]) { unknown++; continue; }
+      if (placed.has(id)) { duplicates++; continue; }
+      placed.add(id);
+      out.push(id);
+    }
+    return out;
+  };
+
+  const rawTiers = Array.isArray(manifest.tiers) ? manifest.tiers : [];
+  const tiers = rawTiers
+    .filter(tier => tier && typeof tier === "object")
+    .map(tier => ({
+      id: asString(tier.id, null) || newId("tier"),
+      name: asString(tier.name, DEFAULT_TIER_NAME),
+      color: asString(tier.color, "#c9c9c9"),
+      items: cleanList(tier.items),
+    }));
+
+  const pool = cleanList(manifest.pool);
+
+  // Anything the archive forgot to place still exists — park it in the pool
+  // rather than losing it.
+  const stranded = Object.keys(items).filter(id => !placed.has(id));
+  pool.push(...stranded);
+
+  if (duplicates > 0) {
+    notes.push(duplicates + (duplicates === 1 ? " duplicate placement was" : " duplicate placements were") + " removed.");
+  }
+  if (unknown > 0) {
+    notes.push(unknown + (unknown === 1 ? " reference to a missing item was" : " references to missing items were") + " dropped.");
+  }
+  if (stranded.length > 0) {
+    notes.push(stranded.length + (stranded.length === 1 ? " unplaced item was" : " unplaced items were") + " moved to Unassigned.");
+  }
+  if (tiers.length === 0) {
+    notes.push("That list had no tiers, so the defaults were used.");
+  }
+
+  const now = new Date().toISOString();
+  const doc = {
+    schema: SCHEMA_VERSION,
+    app: "tierlist",
+    title: asString(manifest.title, "Untitled Tier List"),
+    createdAt: asString(manifest.createdAt, now),
+    modifiedAt: asString(manifest.modifiedAt, now),
+    tiers: tiers.length > 0 ? tiers : createEmptyDocument().tiers,
+    pool,
+    items,
+    images: keptImages,
+  };
+
+  return { doc, images, notes };
+}
+
+async function readArchive(file) {
+  const buffer = await file.arrayBuffer();
+  const files = readZip(new Uint8Array(buffer));
+
+  const entry = files.get(MANIFEST_NAME);
+  if (!entry) {
+    throw new Error("That archive has no " + MANIFEST_NAME + " — it is not a tier list.");
+  }
+
+  const text = new TextDecoder().decode(await unpack(entry));
+  let manifest;
+  try {
+    manifest = JSON.parse(text);
+  } catch (error) {
+    throw new Error("The manifest in that archive is not valid JSON.");
+  }
+
+  return adoptArchive(manifest, files);
+}
+
+/** Replaces the whole document. Frees everything the old one was holding. */
+function adoptDocument(doc, images) {
+  for (const held of runtime.images.values()) URL.revokeObjectURL(held.url);
+  runtime.images.clear();
+  for (const [path, held] of images) runtime.images.set(path, held);
+
+  state = doc;
+  runtime.selectedItemId = null;
+  runtime.panelOpen = false;
+  runtime.panelError = null;
+  runtime.pendingDelete = null;
+  runtime.dirty = false;
+  render();
+}
+
+async function importList(file) {
+  try {
+    const { doc, images, notes } = await readArchive(file);
+    adoptDocument(doc, images);
+    showBanner(notes.length > 0
+      ? { tone: "warn", text: "Loaded with repairs — " + notes.join(" ") }
+      : { tone: "info", text: "Loaded “" + doc.title + "”." });
+  } catch (error) {
+    showBanner({ tone: "warn", text: "Could not open that file: " + error.message });
+  }
+}
+
+/**
+ * Importing throws away whatever is on screen, so unsaved work gets a
+ * confirmation first — in the banner, matching how deletes are confirmed
+ * elsewhere, rather than a native dialog.
+ */
+function requestImport(file) {
+  if (!runtime.dirty) return importList(file);
+
+  showBanner({
+    tone: "warn",
+    text: "Replace the current list with “" + file.name + "”? Unsaved changes will be lost.",
+    actions: [
+      { label: "Replace", onClick: () => { dismissBanner(); return importList(file); } },
+      { label: "Cancel", onClick: dismissBanner },
+    ],
+  });
+}
+
+function showBanner(banner) {
+  runtime.banner = banner;
+  renderBanner();
+}
+
+function dismissBanner() {
+  runtime.banner = null;
+  renderBanner();
+}
+
+/* ==========================================================================
+   8. EVENTS
    ========================================================================== */
 
 /**
@@ -2209,6 +2837,11 @@ function swallowNextClick() {
  * so focus is free to leave. Narrow ones have it float over the board, where
  * tabbing to something underneath it would be tabbing into nowhere.
  */
+function isFileDrag(event) {
+  const transfer = event.dataTransfer;
+  return !!transfer && Array.prototype.includes.call(transfer.types || [], "Files");
+}
+
 function isPanelOverlaying() {
   return typeof window.matchMedia === "function" &&
          window.matchMedia("(max-width: 1100px)").matches;
@@ -2272,6 +2905,18 @@ function bindEvents() {
     clearPendingDelete();
   });
 
+  // Dropping an archive anywhere opens it. The panel's image drop zone stops
+  // its own drops from reaching here.
+  window.addEventListener("dragover", event => {
+    if (isFileDrag(event)) event.preventDefault();
+  });
+  window.addEventListener("drop", event => {
+    if (!isFileDrag(event)) return;
+    event.preventDefault();
+    const file = event.dataTransfer.files[0];
+    if (file) requestImport(file);
+  });
+
   document.addEventListener("keydown", event => {
     if (event.key === "Tab" && runtime.panelOpen && isPanelOverlaying()) {
       trapTab(event);
@@ -2289,7 +2934,7 @@ function bindEvents() {
 }
 
 /* ==========================================================================
-   8. BOOT
+   9. BOOT
    ========================================================================== */
 
 function boot() {

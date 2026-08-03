@@ -358,8 +358,12 @@ including images, with no manual export step.
   becomes a bottom sheet.
 - **Empty states**: an empty pool, an empty tier, and a fresh list each say something
   useful rather than sitting blank.
-- **Errors**: a small toast system for import warnings, rejected files, and quota
-  failures. Nothing should ever fail silently or via `alert()`.
+- **Errors**: Phase 6 already added the banner strip under the header — it carries
+  import results, repair summaries, refusals, and the replace-unsaved-work
+  confirmation, and the panel has its own inline error line for rejected images.
+  What remains here is routing quota failures into the same place and deciding
+  whether anything genuinely warrants a transient toast rather than a persistent
+  banner. Nothing should ever fail silently or via `alert()`.
 - **PNG snapshot export** (nice-to-have): render the board to a canvas for sharing.
   Distinct from the config export and explicitly one-way.
 - Cross-browser pass: Chrome, Firefox, Safari — particularly `CompressionStream`
