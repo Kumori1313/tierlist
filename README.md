@@ -126,4 +126,4 @@ alongside changes to the app's shape.
 
 ## Licence
 
-None specified yet.
+[MIT](LICENSE).
