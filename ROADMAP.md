@@ -201,9 +201,13 @@ items placed only via a temporary "move to tier" control that Phase 2 replaces.
   hovered row; render a live gap at the computed index so the drop position is
   unambiguous before release.
 - Commit: splice out of the source list, splice into the target list, re-render.
-- Edge cases: dropping outside any target returns the item to its origin; dragging the
-  only item in a tier; drag while the detail panel is open (panel stays open and
-  follows the item).
+- Edge cases: releasing outside every drop zone keeps the last previewed position
+  rather than snapping back to the origin — the gap on screen is a promise, and
+  breaking it because the pointer strayed a few pixels off the board is worse than
+  honouring it. Escape is the way to abort. Also: dragging the only item in a tier;
+  drag while the detail panel is open (panel stays open and follows the item).
+- Removing the temporary `<select>` leaves no keyboard route for placing an item until
+  Phase 8 adds one. Known regression, tracked there.
 - Auto-scroll the board when dragging near the viewport's top/bottom edge.
 
 **Done when:** items can be freely rearranged within a tier, between tiers, and to and

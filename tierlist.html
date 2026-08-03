@@ -429,6 +429,11 @@ button {
   color: var(--text);
   overflow: hidden;
   user-select: none;
+  cursor: grab;
+  /* The card is its own drag handle, so the browser must not claim the
+     gesture for panning. Costs touch-scrolling that starts on a card —
+     the board still scrolls from any gap, label or margin. */
+  touch-action: none;
 }
 
 .item-body {
@@ -484,43 +489,6 @@ button {
   .item-tools { opacity: 1; }
 }
 
-/* Temporary placement control — replaced by dragging in Phase 2. A native
-   <select> is used so keyboard and touch work with no extra code. */
-.item-move {
-  -webkit-appearance: none;
-  appearance: none;
-  width: 20px;
-  height: 20px;
-  flex: none;
-  padding: 0;
-  border: 1px solid var(--border);
-  border-radius: var(--r1);
-  background: var(--surface-2);
-  color: transparent;      /* the chosen option's text must not show through */
-  font-size: 10px;
-  cursor: pointer;
-}
-.item-move::after { content: ""; }
-.item-move-wrap {
-  position: relative;
-  width: 20px;
-  height: 20px;
-  flex: none;
-}
-.item-move-wrap::after {
-  content: "⇢";
-  position: absolute;
-  inset: 0;
-  display: grid;
-  place-items: center;
-  color: var(--text-faint);
-  font-size: 11px;
-  pointer-events: none;
-}
-.item-move-wrap:hover::after { color: var(--text); }
-.item-move:hover { background: var(--surface-3); border-color: var(--border-strong); }
-.item-move > option { color: var(--text); background: var(--surface); }
-
 .item-del.confirming {
   width: auto;
   padding: 0 6px;
@@ -530,6 +498,46 @@ button {
   font-size: 9px;
   font-weight: 600;
 }
+
+/* ==========================================================================
+   DRAGGING
+   ========================================================================== */
+
+#drag-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  pointer-events: none;
+}
+
+/* The dragged card's own element stays in the flow as the live gap, dimmed
+   to read as a hole rather than a card. */
+.item.is-placeholder {
+  opacity: .25;
+  filter: saturate(.4);
+}
+.item.is-placeholder .item-tools { display: none; }
+
+.drag-ghost {
+  position: fixed;
+  margin: 0;
+  pointer-events: none;
+  box-shadow: var(--shadow-3);
+  opacity: .95;
+  will-change: transform;
+}
+.drag-ghost .item-tools { display: none; }
+
+body.is-dragging { cursor: grabbing; }
+body.is-dragging .item { cursor: grabbing; }
+body.is-dragging .editable:hover { background: none; cursor: grabbing; }
+
+.tier-drop.is-drop-target,
+#pool-drop.is-drop-target {
+  background: var(--surface-2);
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+#pool-drop.is-drop-target { border-color: var(--accent); }
 
 /* ==========================================================================
    DETAIL PANEL
@@ -643,6 +651,10 @@ button {
   </div>
 </div>
 
+<!-- Dragged cards are rendered here, above everything and outside any
+     scroll container or overflow clip. -->
+<div id="drag-layer" aria-hidden="true"></div>
+
 <script>
 "use strict";
 
@@ -688,6 +700,10 @@ const runtime = {
   dirty: false,
   /** armed two-step delete, e.g. "tier:tier_ab12" or "item:item_cd34" */
   pendingDelete: null,
+  /** a press that has not yet travelled far enough to become a drag */
+  pendingDrag: null,
+  /** the live drag, see section 6 */
+  drag: null,
 };
 
 function createEmptyDocument() {
@@ -926,20 +942,6 @@ function deleteItem(id) {
   if (runtime.selectedItemId === id) closePanel();
 }
 
-/**
- * Appends an item to the end of a destination list.
- * @param {string} dest  a tier id, or "pool"
- */
-function moveItem(id, dest) {
-  commit(() => {
-    const loc = locateItem(id);
-    if (!loc) return;
-    loc.list.splice(loc.index, 1);
-    const tier = dest === "pool" ? null : getTier(dest);
-    (tier ? tier.items : state.pool).push(id);
-  });
-}
-
 /* --- two-step delete ------------------------------------------------------ */
 
 function armDelete(key) {
@@ -967,6 +969,8 @@ const dom = {};
 
 function cacheDom() {
   dom.main       = $("#main");
+  dom.boardScroll = $("#board-scroll");
+  dom.dragLayer  = $("#drag-layer");
   dom.title      = $("#list-title");
   dom.toolbar    = $("#toolbar");
   dom.tiers      = $("#tiers");
@@ -1124,7 +1128,6 @@ function renderItem(item) {
   });
 
   const tools = el("div", { class: "item-tools" }, [
-    !confirming && renderMoveControl(item),
     el("button", {
       class: "icon-btn danger item-del" + (confirming ? " confirming" : ""),
       type: "button",
@@ -1142,35 +1145,6 @@ function renderItem(item) {
     class: "item",
     dataset: { itemId: item.id },
   }, [tools, body, name]);
-}
-
-/**
- * Temporary placement control. Phase 2 removes this entirely — it exists only
- * so items can reach a tier before dragging works.
- */
-function renderMoveControl(item) {
-  const loc = locateItem(item.id);
-  const current = loc && loc.tier ? loc.tier.id : "pool";
-
-  const options = state.tiers.map(tier => el("option", {
-    value: tier.id,
-    text: tier.name || "(unnamed)",
-    selected: tier.id === current,
-  }));
-  options.push(el("option", {
-    value: "pool",
-    text: "Unassigned",
-    selected: current === "pool",
-  }));
-
-  return el("div", { class: "item-move-wrap" }, [
-    el("select", {
-      class: "item-move",
-      title: "Move to…",
-      "aria-label": "Move " + item.name + " to",
-      onchange: event => moveItem(item.id, event.target.value),
-    }, options),
-  ]);
 }
 
 /* --- detail panel --------------------------------------------------------- */
@@ -1200,11 +1174,271 @@ function closePanel() {
 }
 
 /* ==========================================================================
-   6. EVENTS
+   6. DRAGGING
+
+   Pointer Events rather than the HTML5 drag-and-drop API: consistent on
+   touch, and the drag image is a real element we can style.
+
+   The dragged card's own element doubles as the placeholder — it is moved
+   around the DOM during the drag to preview the drop, while a clone follows
+   the pointer. On release the destination lists are read back out of the DOM,
+   so what was previewed is exactly what is committed. Nothing touches `state`
+   until the drop, which makes cancelling a matter of re-rendering.
+
+   Phase 3 reuses this engine for whole tiers.
+   ========================================================================== */
+
+const DRAG_THRESHOLD = 5;        // px of travel before a press becomes a drag
+const AUTOSCROLL_EDGE = 64;      // px band at the board's edges
+const AUTOSCROLL_MAX = 22;       // px per frame at the very edge
+
+function onItemPointerDown(event) {
+  if (runtime.drag) return;
+  if (event.pointerType === "mouse" && event.button !== 0) return;
+
+  const card = event.target.closest(".item");
+  if (!card) return;
+  // Controls and an in-progress rename own their own gestures.
+  if (event.target.closest(".item-tools, .inline-input")) return;
+
+  runtime.pendingDrag = {
+    card,
+    pointerId: event.pointerId,
+    startX: event.clientX,
+    startY: event.clientY,
+  };
+  window.addEventListener("pointermove", onDragPointerMove);
+  window.addEventListener("pointerup", onDragPointerUp);
+  window.addEventListener("pointercancel", onDragPointerCancel);
+}
+
+function onDragPointerMove(event) {
+  const pending = runtime.pendingDrag;
+
+  if (pending && !runtime.drag) {
+    if (event.pointerId !== pending.pointerId) return;
+    const travelled = Math.hypot(event.clientX - pending.startX,
+                                 event.clientY - pending.startY);
+    if (travelled < DRAG_THRESHOLD) return;
+    beginDrag(pending, event);
+  }
+
+  const drag = runtime.drag;
+  if (!drag || event.pointerId !== drag.pointerId) return;
+  drag.pointerX = event.clientX;
+  drag.pointerY = event.clientY;
+  event.preventDefault();
+}
+
+function onDragPointerUp(event) {
+  if (runtime.pendingDrag && event.pointerId !== runtime.pendingDrag.pointerId) return;
+  const wasDragging = runtime.drag != null;
+  releaseDragListeners();
+  if (wasDragging) {
+    endDrag(true);
+    swallowNextClick();   // a drag must not also fire the card's click handlers
+  }
+}
+
+function onDragPointerCancel() {
+  releaseDragListeners();
+  if (runtime.drag) endDrag(false);
+}
+
+function releaseDragListeners() {
+  runtime.pendingDrag = null;
+  window.removeEventListener("pointermove", onDragPointerMove);
+  window.removeEventListener("pointerup", onDragPointerUp);
+  window.removeEventListener("pointercancel", onDragPointerCancel);
+}
+
+function beginDrag(pending, event) {
+  const card = pending.card;
+  const rect = card.getBoundingClientRect();
+
+  const ghost = card.cloneNode(true);
+  ghost.classList.add("drag-ghost");
+  ghost.classList.remove("is-placeholder");
+  Object.assign(ghost.style, {
+    left: rect.left + "px",
+    top: rect.top + "px",
+    width: rect.width + "px",
+    height: rect.height + "px",
+  });
+  dom.dragLayer.append(ghost);
+
+  card.classList.add("is-placeholder");
+  document.body.classList.add("is-dragging");
+
+  // "Empty" hints would otherwise take up room in the zones being dropped
+  // into. The next render puts them back.
+  for (const hint of dom.boardScroll.querySelectorAll(".empty-hint")) hint.remove();
+
+  const zone = card.parentNode;
+  zone.classList.add("is-drop-target");
+
+  runtime.drag = {
+    card,
+    ghost,
+    zone,
+    originZone: zone,
+    pointerId: pending.pointerId,
+    startX: pending.startX,
+    startY: pending.startY,
+    pointerX: event.clientX,
+    pointerY: event.clientY,
+    zones: [...dom.boardScroll.querySelectorAll("[data-drop-zone]")],
+    frame: 0,
+  };
+  runtime.drag.frame = requestAnimationFrame(dragFrame);
+}
+
+/**
+ * One loop for the whole drag rather than work on each pointermove: it keeps
+ * the ghost in sync at the display's rate, and it means auto-scroll keeps
+ * running while the pointer is held still at the edge.
+ */
+function dragFrame() {
+  const drag = runtime.drag;
+  if (!drag) return;
+
+  drag.ghost.style.transform =
+    "translate(" + (drag.pointerX - drag.startX) + "px," +
+                   (drag.pointerY - drag.startY) + "px) rotate(2.5deg) scale(1.04)";
+
+  autoScroll(drag);
+  updatePlaceholder(drag);
+
+  drag.frame = requestAnimationFrame(dragFrame);
+}
+
+function autoScroll(drag) {
+  const rect = dom.boardScroll.getBoundingClientRect();
+  let dy = 0;
+
+  if (drag.pointerY < rect.top + AUTOSCROLL_EDGE) {
+    const depth = (rect.top + AUTOSCROLL_EDGE - drag.pointerY) / AUTOSCROLL_EDGE;
+    dy = -AUTOSCROLL_MAX * Math.min(1, depth);
+  } else if (drag.pointerY > rect.bottom - AUTOSCROLL_EDGE) {
+    const depth = (drag.pointerY - (rect.bottom - AUTOSCROLL_EDGE)) / AUTOSCROLL_EDGE;
+    dy = AUTOSCROLL_MAX * Math.min(1, depth);
+  }
+
+  if (dy) dom.boardScroll.scrollTop += dy;
+}
+
+/** Rects are read fresh each frame: moving the placeholder reflows the board. */
+function zoneAt(drag, x, y) {
+  for (const zone of drag.zones) {
+    const rect = zone.getBoundingClientRect();
+    if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) {
+      return zone;
+    }
+  }
+  return null;
+}
+
+/**
+ * The card the placeholder should sit before, or null to append.
+ *
+ * Cards wrap onto multiple rows, so the scan is row-major: skip rows entirely
+ * above the pointer, then within the pointer's row take the first card whose
+ * horizontal midpoint the pointer has not yet passed. Running off the end of a
+ * row falls through to the next row's first card, whose top is below the
+ * pointer — which is the correct answer for "past the end of this row".
+ */
+function insertionRef(zone, placeholder, x, y) {
+  for (const card of zone.children) {
+    if (card === placeholder || !card.classList.contains("item")) continue;
+    const rect = card.getBoundingClientRect();
+    if (y > rect.bottom) continue;
+    if (y < rect.top) return card;
+    if (x < rect.left + rect.width / 2) return card;
+  }
+  return null;
+}
+
+function updatePlaceholder(drag) {
+  const zone = zoneAt(drag, drag.pointerX, drag.pointerY);
+
+  if (zone !== drag.zone) {
+    if (drag.zone) drag.zone.classList.remove("is-drop-target");
+    if (zone) zone.classList.add("is-drop-target");
+    drag.zone = zone;
+  }
+
+  // Outside every zone: leave the preview where it was, so releasing there
+  // drops the item back at its last valid position rather than nowhere.
+  if (!zone) return;
+
+  const before = insertionRef(zone, drag.card, drag.pointerX, drag.pointerY);
+  if (before === drag.card) return;
+  if (drag.card.parentNode === zone && drag.card.nextSibling === before) return;
+  zone.insertBefore(drag.card, before);
+}
+
+/** @param {boolean} keep  commit the previewed position, or discard it */
+function endDrag(keep) {
+  const drag = runtime.drag;
+  if (!drag) return;
+  runtime.drag = null;
+
+  cancelAnimationFrame(drag.frame);
+  drag.ghost.remove();
+  document.body.classList.remove("is-dragging");
+  if (drag.zone) drag.zone.classList.remove("is-drop-target");
+  drag.card.classList.remove("is-placeholder");
+
+  if (!keep) {
+    // `state` was never touched, so a re-render is the whole undo.
+    render();
+    return;
+  }
+
+  const touched = new Set([drag.originZone, drag.card.parentNode]);
+  commit(() => {
+    for (const zone of touched) syncListFromDom(zone);
+  });
+}
+
+function listForZone(zone) {
+  if (!zone || !zone.dataset) return null;
+  if (zone.dataset.dropZone === "pool") return state.pool;
+  const tier = getTier(zone.dataset.tierId);
+  return tier ? tier.items : null;
+}
+
+/** Adopts the DOM's card order as the truth for that zone's list. */
+function syncListFromDom(zone) {
+  const list = listForZone(zone);
+  if (!list) return;
+  const ids = [];
+  for (const node of zone.children) {
+    if (node.classList.contains("item")) ids.push(node.dataset.itemId);
+  }
+  list.length = 0;
+  list.push(...ids);
+}
+
+function swallowNextClick() {
+  const swallow = event => {
+    event.stopPropagation();
+    event.preventDefault();
+  };
+  window.addEventListener("click", swallow, { capture: true, once: true });
+  // Touch may never produce the click; don't leave the trap armed for the
+  // user's next real one.
+  setTimeout(() => window.removeEventListener("click", swallow, { capture: true }), 350);
+}
+
+/* ==========================================================================
+   7. EVENTS
    ========================================================================== */
 
 function bindEvents() {
   dom.panelClose.addEventListener("click", closePanel);
+
+  dom.boardScroll.addEventListener("pointerdown", onItemPointerDown);
 
   dom.title.classList.add("editable");
   dom.title.title = "Click to rename";
@@ -1223,13 +1457,18 @@ function bindEvents() {
 
   document.addEventListener("keydown", event => {
     if (event.key !== "Escape") return;
+    if (runtime.drag) {
+      releaseDragListeners();
+      endDrag(false);
+      return;
+    }
     if (clearPendingDelete()) return;
     if (runtime.panelOpen) closePanel();
   });
 }
 
 /* ==========================================================================
-   7. BOOT
+   8. BOOT
    ========================================================================== */
 
 function boot() {
