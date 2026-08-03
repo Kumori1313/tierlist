@@ -1017,6 +1017,8 @@ const runtime = {
   panelError: null,
   /** the notice strip under the header, see showBanner */
   banner: null,
+  /** persistence, see section 8. `available` is null until probed. */
+  storage: { available: null, db: null, error: null },
 };
 
 function createEmptyDocument() {
@@ -1069,7 +1071,7 @@ function commit(mutate, opts = {}) {
   mutate();
   state.modifiedAt = new Date().toISOString();
   runtime.dirty = true;
-  // Phase 7: schedule a debounced autosave here.
+  scheduleSave();
   if (!opts.silent) render();
 }
 
@@ -1495,6 +1497,10 @@ function renderHeader() {
     el("button", { class: "tool-btn", type: "button", text: "Add item", onclick: () => addItem() }),
     el("button", { class: "tool-btn", type: "button", text: "Add tier", onclick: addTier }),
     picker,
+    el("button", {
+      class: "tool-btn", type: "button", text: "New", title: "Start an empty list",
+      onclick: newList,
+    }),
     el("button", {
       class: "tool-btn", type: "button", text: "Open", title: "Open a .tierlist file",
       onclick: () => picker.click(),
@@ -2595,15 +2601,18 @@ function downloadBlob(blob, filename) {
 const asString = (value, fallback) => typeof value === "string" ? value : fallback;
 
 /**
- * Turns whatever was in the archive into a document this app can render.
+ * Turns a stored manifest into a document this app can render, whatever it
+ * came from — an archive or the autosaved session.
  *
  * Repairs rather than rejects wherever the intent is recoverable: duplicate
  * placements, items that belong to no list, references to items that no longer
- * exist, images the archive is missing. Only an unreadable manifest is fatal.
+ * exist, images whose bytes are gone. Only an unreadable manifest is fatal.
  *
+ * @param {object} manifest
+ * @param {(path: string) => Promise<Uint8Array|null>} getBytes
  * @returns {{doc: object, images: Map, notes: string[]}}
  */
-async function adoptArchive(manifest, files) {
+async function adoptManifest(manifest, getBytes) {
   const notes = [];
 
   if (typeof manifest !== "object" || manifest === null) {
@@ -2642,20 +2651,23 @@ async function adoptArchive(manifest, files) {
 
   for (const item of Object.values(items)) {
     if (!item.image) continue;
+    if (images.has(item.image)) continue;
 
-    const entry = files.get(item.image);
-    if (!entry) {
-      // The manifest points at a file the archive does not contain. Keep the
-      // item, drop the picture, say so.
-      if (item.shortType === "image") item.shortType = "text";
-      item.image = null;
+    const bytes = await getBytes(item.image);
+    if (!bytes) {
+      // The manifest points at bytes that are not there. Keep the item, drop
+      // the picture, say so.
+      for (const sibling of Object.values(items)) {
+        if (sibling.image !== item.image) continue;
+        if (sibling.shortType === "image") sibling.shortType = "text";
+        sibling.image = null;
+      }
       missing++;
       continue;
     }
 
-    if (!images.has(item.image)) {
+    {
       const meta = rawImages[item.image] || {};
-      const bytes = await unpack(entry);
       const mime = asString(meta.mime, "application/octet-stream");
       const blob = new Blob([bytes], { type: mime });
 
@@ -2770,11 +2782,14 @@ async function readArchive(file) {
     throw new Error("The manifest in that archive is not valid JSON.");
   }
 
-  return adoptArchive(manifest, files);
+  return adoptManifest(manifest, async path => {
+    const file = files.get(path);
+    return file ? unpack(file) : null;
+  });
 }
 
 /** Replaces the whole document. Frees everything the old one was holding. */
-function adoptDocument(doc, images) {
+function installDocument(doc, images) {
   for (const held of runtime.images.values()) URL.revokeObjectURL(held.url);
   runtime.images.clear();
   for (const [path, held] of images) runtime.images.set(path, held);
@@ -2791,7 +2806,7 @@ function adoptDocument(doc, images) {
 async function importList(file) {
   try {
     const { doc, images, notes } = await readArchive(file);
-    adoptDocument(doc, images);
+    installDocument(doc, images);
     showBanner(notes.length > 0
       ? { tone: "warn", text: "Loaded with repairs — " + notes.join(" ") }
       : { tone: "info", text: "Loaded “" + doc.title + "”." });
@@ -2829,7 +2844,230 @@ function dismissBanner() {
 }
 
 /* ==========================================================================
-   8. EVENTS
+   8. STORAGE
+
+   The session autosaves to IndexedDB — not localStorage, which cannot hold
+   blobs and would be exhausted by a handful of images anyway. The document
+   goes in one store, image bytes in another, keyed by the same archive paths
+   the manifest uses, so restoring reuses the importer's validation wholesale.
+
+   None of this is guaranteed to work. Opened over file://, some browsers
+   treat every page as its own opaque origin and refuse persistent storage
+   outright. That is detected once at boot, and the app degrades to
+   export-only with a visible warning rather than pretending to save.
+   ========================================================================== */
+
+const DB_NAME = "tierlist";
+const DB_VERSION = 1;
+const STORE_DOC = "document";
+const STORE_IMAGES = "images";
+const DOC_KEY = "current";
+const SAVE_DEBOUNCE_MS = 600;
+const DB_OPEN_TIMEOUT_MS = 4000;
+
+function promisify(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("Request failed"));
+  });
+}
+
+function openDatabase() {
+  return new Promise((resolve, reject) => {
+    if (typeof indexedDB === "undefined" || indexedDB === null) {
+      reject(new Error("This browser has no IndexedDB."));
+      return;
+    }
+
+    let request;
+    try {
+      request = indexedDB.open(DB_NAME, DB_VERSION);
+    } catch (error) {
+      // Opening can throw outright on an opaque origin.
+      reject(error);
+      return;
+    }
+
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(STORE_DOC)) db.createObjectStore(STORE_DOC);
+      if (!db.objectStoreNames.contains(STORE_IMAGES)) db.createObjectStore(STORE_IMAGES);
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("IndexedDB is unavailable."));
+    request.onblocked = () => reject(new Error("Another tab is holding the database open."));
+  });
+}
+
+/** Some file:// contexts neither resolve nor reject; don't hang the boot. */
+function withTimeout(promise, ms, message) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms)),
+  ]);
+}
+
+async function initStorage() {
+  if (runtime.storage.available !== null) return runtime.storage.available;
+
+  try {
+    runtime.storage.db = await withTimeout(
+      openDatabase(), DB_OPEN_TIMEOUT_MS, "Storage did not respond.");
+    runtime.storage.available = true;
+  } catch (error) {
+    runtime.storage.db = null;
+    runtime.storage.available = false;
+    runtime.storage.error = error.message;
+  }
+  return runtime.storage.available;
+}
+
+/** One read-write transaction, resolving when it commits rather than per request. */
+function writeTransaction(db, work) {
+  return new Promise((resolve, reject) => {
+    let tx;
+    try {
+      tx = db.transaction([STORE_DOC, STORE_IMAGES], "readwrite");
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error || new Error("Could not write to storage."));
+    tx.onabort = () => reject(tx.error || new Error("Storage write was aborted."));
+    work(tx.objectStore(STORE_DOC), tx.objectStore(STORE_IMAGES));
+  });
+}
+
+async function saveSession() {
+  const db = runtime.storage.db;
+  if (!db) return;
+
+  const doc = serializeDocument();
+  const wanted = Object.keys(doc.images);
+
+  // Which blobs are already down there? Read in its own transaction: awaiting
+  // inside a live one lets it commit out from under the writes.
+  const stored = await promisify(
+    db.transaction(STORE_IMAGES, "readonly").objectStore(STORE_IMAGES).getAllKeys());
+
+  const toWrite = wanted
+    .filter(path => !stored.includes(path) && runtime.images.has(path))
+    .map(path => [path, runtime.images.get(path).blob]);
+  const toDrop = stored.filter(path => !wanted.includes(path));
+
+  await writeTransaction(db, (docs, images) => {
+    docs.put(doc, DOC_KEY);
+    for (const [path, blob] of toWrite) images.put(blob, path);
+    for (const path of toDrop) images.delete(path);
+  });
+}
+
+let saveTimer = 0;
+
+function scheduleSave() {
+  if (runtime.storage.available === false) return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveNow, SAVE_DEBOUNCE_MS);
+}
+
+async function saveNow() {
+  clearTimeout(saveTimer);
+  if (!(await initStorage())) return;
+
+  try {
+    await saveSession();
+    runtime.storage.error = null;
+  } catch (error) {
+    // Most likely the quota. Say so once and stop trying on every keystroke.
+    runtime.storage.available = false;
+    runtime.storage.error = error.message;
+    showBanner({
+      tone: "warn",
+      text: "Changes are no longer being saved automatically (" + error.message +
+            ") — use Save to keep this list.",
+    });
+  }
+}
+
+async function loadSession() {
+  const db = runtime.storage.db;
+  if (!db) return null;
+
+  const manifest = await promisify(
+    db.transaction(STORE_DOC, "readonly").objectStore(STORE_DOC).get(DOC_KEY));
+  if (!manifest) return null;
+
+  return adoptManifest(manifest, async path => {
+    const blob = await promisify(
+      db.transaction(STORE_IMAGES, "readonly").objectStore(STORE_IMAGES).get(path));
+    if (!blob) return null;
+    return new Uint8Array(await blob.arrayBuffer());
+  });
+}
+
+async function restoreSession() {
+  if (!(await initStorage())) {
+    showBanner({
+      tone: "warn",
+      text: "This browser will not let the page store anything (" +
+            runtime.storage.error + "). Your work is kept only until you close " +
+            "the tab — use Save to keep it.",
+    });
+    return;
+  }
+
+  try {
+    const restored = await loadSession();
+    if (!restored) return;
+    installDocument(restored.doc, restored.images);
+    if (restored.notes.length > 0) {
+      showBanner({
+        tone: "warn",
+        text: "Restored with repairs — " + restored.notes.join(" "),
+      });
+    }
+  } catch (error) {
+    showBanner({ tone: "warn", text: "Could not restore the last session: " + error.message });
+  }
+}
+
+async function clearStoredSession() {
+  const db = runtime.storage.db;
+  if (!db) return;
+  try {
+    await writeTransaction(db, (docs, images) => {
+      docs.delete(DOC_KEY);
+      images.clear();
+    });
+  } catch (error) {
+    // Nothing useful to do; the next save overwrites it anyway.
+  }
+}
+
+/** Throws the current list away and starts over. */
+function newList() {
+  const start = async () => {
+    dismissBanner();
+    installDocument(createEmptyDocument(), new Map());
+    await clearStoredSession();
+    saveNow();
+  };
+
+  if (!runtime.dirty) return start();
+
+  showBanner({
+    tone: "warn",
+    text: "Start a new list? Unsaved changes will be lost.",
+    actions: [
+      { label: "New list", onClick: start },
+      { label: "Cancel", onClick: dismissBanner },
+    ],
+  });
+}
+
+/* ==========================================================================
+   9. EVENTS
    ========================================================================== */
 
 /**
@@ -2905,6 +3143,15 @@ function bindEvents() {
     clearPendingDelete();
   });
 
+  // Only worth interrupting someone when their work genuinely is at risk.
+  // With autosave working, closing the tab loses nothing, so the warning is
+  // reserved for the case where nothing is being persisted.
+  window.addEventListener("beforeunload", event => {
+    if (!runtime.dirty || runtime.storage.available !== false) return;
+    event.preventDefault();
+    event.returnValue = "";
+  });
+
   // Dropping an archive anywhere opens it. The panel's image drop zone stops
   // its own drops from reaching here.
   window.addEventListener("dragover", event => {
@@ -2934,14 +3181,17 @@ function bindEvents() {
 }
 
 /* ==========================================================================
-   9. BOOT
+   10. BOOT
    ========================================================================== */
 
-function boot() {
+async function boot() {
   cacheDom();
   bindEvents();
-  // Phase 7 restores a persisted session here before the first render.
+
+  // Paint the empty board immediately: opening the database can take a moment,
+  // and a blank screen while it does would be worse than a brief default list.
   render();
+  await restoreSession();
 }
 
 boot();

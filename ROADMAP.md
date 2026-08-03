@@ -335,7 +335,10 @@ names, both description fields, colours, images — is byte-for-byte the same li
 - Autosave to **IndexedDB** (not localStorage — blobs, and a 5MB quota that images blow
   through instantly). One object store for the JSON state, one for image blobs.
 - Debounced writes on any state mutation; restore on load if a session exists.
-- `beforeunload` warning only when there are changes since the last export.
+- `beforeunload` warning only when work would genuinely be lost — that is, when the
+  document is dirty *and* storage is unavailable. Warning on every close while autosave
+  is quietly working teaches people to dismiss the dialog without reading it, which
+  costs exactly the one time it mattered.
 - "New list" / "Clear" with confirmation.
 
 **Done when:** closing and reopening the file restores the exact working state,
