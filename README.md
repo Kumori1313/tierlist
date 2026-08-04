@@ -6,6 +6,9 @@ download `tierlist.html`, open it in a browser, and it works, including offline.
 Lists save as a `.tierlist` file that bundles the configuration and every uploaded
 image together, so the exact same list opens on another machine.
 
+![A tier list ranking Linux distributions across five tiers, each item a card showing
+the distribution's logo with its name overlaid](screenshot.png)
+
 ## Getting started
 
 1. Download [`tierlist.html`](tierlist.html).
