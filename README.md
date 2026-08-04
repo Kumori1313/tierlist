@@ -103,8 +103,9 @@ archive, storage, keyboard, events, boot. Every mutation goes through a single
 `commit()`, which is what makes undo and autosave possible without touching each call
 site.
 
-`ROADMAP.md` records the plan the app was built to, including the decisions that changed
-along the way and why.
+`DESIGN.md` explains why the app is built the way it is — the alternatives considered,
+the invariants the data model guarantees, and the decisions that changed once they met
+reality.
 
 ### Tests
 
