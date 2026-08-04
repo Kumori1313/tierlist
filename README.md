@@ -109,24 +109,27 @@ reality.
 
 ### Tests
 
-There is no build step and no test framework, so the harness supplies a browser instead
-— a minimal DOM with fake geometry, a fake IndexedDB, and stand-ins for `Blob`, canvas,
-image decoding and object URLs. It loads the real `<script>` out of the HTML and runs it.
+There is no build step and no test framework, so `harness.js` supplies the browser
+instead — a minimal DOM with fake geometry, a fake IndexedDB, and stand-ins for `Blob`,
+canvas, image decoding and object URLs. It loads the real `<script>` out of the HTML and
+hands back the app's internals. Two suites run against it:
 
 ```sh
-gjs smoke.js                       # from this directory
-gjs smoke.js path/to/tierlist.html # from anywhere
+gjs smoke.js      # 350 assertions: the app's behaviour
+gjs ziptest.js    # 73 assertions: archives written by other tools
 ```
 
-423 assertions covering state transitions, the drag engine's insertion maths, panel
-editing, the image pipeline, ZIP round-trips, import repair, persistence, undo, and
-keyboard placement. Every object URL minted and revoked is tracked, so a leak fails the
-run.
+Both take an optional path to `tierlist.html` and otherwise look in the working
+directory. Each exits non-zero if anything fails.
 
-The last group reads archives in `fixtures/`, written by 7-Zip, libarchive and Python's
+`smoke.js` covers state transitions, the drag engine's insertion maths, panel editing,
+the image pipeline, ZIP round-trips, import repair, persistence, undo, and keyboard
+placement. Every object URL minted and revoked is tracked, so a leak fails the run.
+
+`ziptest.js` reads the archives in `fixtures/`, written by 7-Zip, libarchive and Python's
 `zipfile` — three writers that lay out ZIP headers differently, which is what a
-hand-written reader has to survive. Those archives are committed, so the tests run
-anywhere; regenerating them needs 7-Zip and bsdtar:
+hand-written reader has to survive. Those archives are committed, so the suite runs
+without those tools installed; regenerating them needs 7-Zip and bsdtar:
 
 ```sh
 python3 fixtures/make-fixtures.py

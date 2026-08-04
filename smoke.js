@@ -1,412 +1,27 @@
-// Headless smoke test for tierlist.html.
+// Behaviour tests for tierlist.html.
 //
 //   gjs smoke.js [path/to/tierlist.html]
 //
-// The app is a single file with no build step and no test framework, so this
-// supplies the browser instead: a minimal DOM with fake geometry, a fake
-// IndexedDB, and stand-ins for Blob, canvas, image decoding and object URLs.
-// It loads the real <script> out of the HTML and runs it.
+// The stubbed browser these run against lives in harness.js; see that file for
+// what is and is not simulated. Archives written by other tools are covered
+// separately by ziptest.js.
 //
-// What it does cover: state transitions, the drag engine's insertion maths and
+// What this covers: state transitions, the drag engine's insertion maths and
 // commit path, panel editing, the image pipeline's branching, ZIP round-trips,
 // import repair, persistence, undo, keyboard placement, and object-URL
 // lifetime — every mint and revoke is tracked, so leaks fail the run.
 //
-// Archives written by 7-Zip, libarchive and Python's zipfile live in
-// fixtures/ and are read back here; see fixtures/make-fixtures.py.
-//
-// What it does not cover, and cannot: CSS, real layout, animation, actual
-// pixels. The fakes approximate their real counterparts — IndexedDB
-// transaction lifetime especially — so a pass here means the logic holds, not
-// that the app looks or feels right. Compression is one concrete gap: GJS has
-// no CompressionStream, so the ZIP writer falls back to storing and the
-// deflate path is exercised only in a real browser.
+// What it cannot cover: CSS, real layout, animation, actual pixels. A pass
+// means the logic holds, not that the app looks or feels right.
 
 const GLib = imports.gi.GLib;
-const Gio = imports.gi.Gio;
+
+imports.searchPath.unshift(GLib.path_get_dirname(
+  GLib.canonicalize_filename(imports.system.programInvocationName, null)));
 
 const TARGET = (typeof ARGV !== "undefined" && ARGV[0])
   ? ARGV[0]
   : GLib.build_filenamev([GLib.get_current_dir(), "tierlist.html"]);
-
-/* ========================================================================== */
-/* DOM stub                                                                   */
-/* ========================================================================== */
-
-function matches(node, selector) {
-  return selector.split(",").map(s => s.trim()).some(sel => {
-    if (sel.startsWith(".")) return node._class.split(" ").includes(sel.slice(1));
-    if (sel.startsWith("[") && sel.endsWith("]")) {
-      const attr = sel.slice(1, -1);                        // data-drop-zone
-      const key = attr.replace(/-([a-z])/g, (_, c) => c.toUpperCase()).replace(/^data/, "");
-      return node.dataset[key[0].toLowerCase() + key.slice(1)] !== undefined;
-    }
-    return node.tagName === sel;
-  });
-}
-
-class Node {
-  constructor(tag) {
-    this.tagName = tag;
-    this.children = [];
-    this.attrs = {};
-    this.dataset = {};
-    this.style = { _custom: {}, setProperty(k, v) { this._custom[k] = v; } };
-    this.listeners = {};
-    this.parentNode = null;
-    this._text = null;
-    this._class = "";
-    this._rect = { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 };
-  }
-
-  get className() { return this._class; }
-  set className(v) { this._class = v; }
-  get classList() {
-    const self = this;
-    return {
-      add(...c) { self._class = [...new Set(self._class.split(" ").filter(Boolean).concat(c))].join(" "); },
-      remove(c) { self._class = self._class.split(" ").filter(x => x && x !== c).join(" "); },
-      contains(c) { return self._class.split(" ").includes(c); },
-      toggle(c, on) { on ? this.add(c) : this.remove(c); },
-    };
-  }
-
-  get textContent() { return this._text; }
-  set textContent(v) { this._text = String(v); this.children = []; }
-
-  get firstChild() { return this.children[0] || null; }
-  get nextSibling() {
-    if (!this.parentNode) return null;
-    const i = this.parentNode.children.indexOf(this);
-    return this.parentNode.children[i + 1] || null;
-  }
-
-  append(...kids) {
-    for (const k of kids) { k.parentNode?.removeChild(k); k.parentNode = this; this.children.push(k); }
-  }
-  insertBefore(node, ref) {
-    node.parentNode?.removeChild(node);
-    node.parentNode = this;
-    if (!ref) { this.children.push(node); return node; }
-    this.children.splice(this.children.indexOf(ref), 0, node);
-    return node;
-  }
-  removeChild(c) { this.children = this.children.filter(x => x !== c); c.parentNode = null; }
-  remove() { this.parentNode?.removeChild(this); }
-  replaceChildren(...kids) {
-    for (const c of this.children) c.parentNode = null;
-    this.children = [];
-    this._text = null;
-    this.append(...kids);
-  }
-
-  replaceWith(node) {
-    const parent = this.parentNode;
-    if (!parent) return;
-    parent.children.splice(parent.children.indexOf(this), 1, node);
-    node.parentNode = parent;
-    this.parentNode = null;
-  }
-  contains(node) {
-    for (let n = node; n; n = n.parentNode) if (n === this) return true;
-    return false;
-  }
-  get scrollHeight() { return this._rect.height; }
-  focus() { globalThis.document.activeElement = this; }
-
-  setAttribute(k, v) { this.attrs[k] = v; }
-  getAttribute(k) { return this.attrs[k]; }
-  addEventListener(t, fn) { (this.listeners[t] ||= []).push(fn); }
-  select() {} click() {}
-  getBoundingClientRect() { return this._rect; }
-  get offsetTop() { return this._rect.top; }
-  get offsetHeight() { return this._rect.height; }
-
-  cloneNode() {
-    const copy = new Node(this.tagName);
-    copy._class = this._class;
-    copy._text = this._text;
-    Object.assign(copy.attrs, this.attrs);
-    Object.assign(copy.dataset, this.dataset);
-    copy._rect = { ...this._rect };
-    for (const c of this.children) copy.append(c.cloneNode());
-    return copy;
-  }
-
-  closest(sel) {
-    let n = this;
-    while (n) { if (matches(n, sel)) return n; n = n.parentNode; }
-    return null;
-  }
-  querySelectorAll(sel, out = []) {
-    for (const c of this.children) { if (matches(c, sel)) out.push(c); c.querySelectorAll(sel, out); }
-    return out;
-  }
-
-  fire(type, event = {}) {
-    for (const fn of this.listeners[type] || []) {
-      fn({ currentTarget: this, target: this, preventDefault() {}, stopPropagation() {}, ...event });
-    }
-  }
-  find(cls) {
-    if (this._class.split(" ").includes(cls)) return this;
-    for (const c of this.children) { const hit = c.find?.(cls); if (hit) return hit; }
-    return null;
-  }
-  findAll(cls, out = []) {
-    if (this._class.split(" ").includes(cls)) out.push(this);
-    for (const c of this.children) c.findAll?.(cls, out);
-    return out;
-  }
-}
-
-/* --- the app's static shell, with real containment ------------------------ */
-
-const shell = {};
-const mk = id => (shell[id] = new Node(id));
-
-const main = mk("#main");
-const boardScroll = mk("#board-scroll");
-const board = new Node("#board");
-const tiersEl = mk("#tiers");
-const poolSection = new Node("#pool-section");
-const poolDrop = mk("#pool-drop");
-const panel = mk("#panel");
-mk("#list-title"); mk("#toolbar"); mk("#panel-body"); mk("#panel-close"); mk("#drag-layer");
-const bannerEl = mk("#banner");
-const liveEl = mk("#live");
-
-boardScroll.append(board);
-board.append(tiersEl, poolSection);
-poolSection.append(poolDrop);
-main.append(boardScroll, panel);
-boardScroll._rect = { left: 0, top: 60, right: 1200, bottom: 860, width: 1200, height: 800 };
-boardScroll.scrollTop = 0;
-
-globalThis.document = {
-  body: new Node("body"),
-  activeElement: null,
-  querySelector: sel => shell[sel] || null,
-  createElement: tag => {
-    const node = new Node(tag);
-    if (tag === "a") node.click = () => downloads.push({ name: node.attrs.download });
-    if (tag === "canvas") {
-      node.getContext = () => ({
-        calls: [],
-        save() {}, restore() {}, scale() {}, beginPath() {}, clip() {}, stroke() {},
-        rect() {}, roundRect() {}, fillRect() {}, drawImage() { this.calls.push("image"); },
-        fillText(text) { this.calls.push("text:" + text); },
-        measureText: text => ({ width: text.length * 6 }),
-        createLinearGradient: () => ({ addColorStop() {} }),
-        set fillStyle(v) {}, set strokeStyle(v) {}, set font(v) {},
-        set textAlign(v) {}, set textBaseline(v) {}, set lineWidth(v) {},
-      });
-      node.toBlob = (cb, type) => {
-        const bytes = new Uint8Array(64).map((_, i) => i & 0xff);
-        cb({
-          type, size: bytes.length, _bytes: bytes,
-          async arrayBuffer() { return bytes.buffer.slice(0, bytes.length); },
-        });
-      };
-      lastCanvas = node;
-    }
-    return node;
-  },
-  addEventListener() {},
-};
-globalThis.crypto = {
-  getRandomValues(a) { for (let i = 0; i < a.length; i++) a[i] = Math.floor(Math.random() * 256); return a; },
-};
-
-// GJS already exposes `window` as an alias of the global object and won't let
-// it be replaced, so the listener API goes straight onto globalThis.
-const winListeners = {};
-globalThis.addEventListener = (t, fn) => { (winListeners[t] ||= []).push(fn); };
-globalThis.removeEventListener = (t, fn) => {
-  winListeners[t] = (winListeners[t] || []).filter(f => f !== fn);
-};
-const fireWindow = (t, ev) => { for (const fn of [...(winListeners[t] || [])]) fn(ev); };
-
-// A queue, not a slot: flipRows schedules nested frames from inside dragFrame.
-let frameQueue = [];
-globalThis.requestAnimationFrame = fn => frameQueue.push(fn);
-globalThis.cancelAnimationFrame = () => { frameQueue = []; };
-
-// Long-press timers, driven manually so tests never wait on wall time.
-let timers = [];
-globalThis.setTimeout = (fn, ms) => { timers.push({ fn, ms }); return timers.length; };
-globalThis.clearTimeout = id => { if (timers[id - 1]) timers[id - 1].fn = null; };
-const fireTimers = () => { const due = timers; timers = []; for (const t of due) t.fn?.(); };
-
-globalThis.navigator = { vibrate() {} };
-
-/* --- image stubs, with object-URL bookkeeping ------------------------------
-   The phase 5 exit criterion is that no object URL leaks, so every mint and
-   every revoke is recorded. */
-
-let urlSeq = 0;
-const urlsMinted = new Set();
-const urlsRevoked = new Set();
-globalThis.URL = {
-  createObjectURL(blob) {
-    const url = "blob:fake/" + (++urlSeq);
-    urlsMinted.add(url);
-    return url;
-  },
-  revokeObjectURL(url) { urlsRevoked.add(url); },
-};
-
-/** A stand-in File. `w`/`h` drive what createImageBitmap reports. */
-function fakeFile(name, type, { w = 400, h = 300, size = 12 } = {}) {
-  const bytes = new Uint8Array(size).map((_, i) => (i * 7 + name.length) & 0xff);
-  return {
-    name, type, size: bytes.length, _w: w, _h: h, _bytes: bytes,
-    async arrayBuffer() {
-      return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-    },
-  };
-}
-
-globalThis.createImageBitmap = async file => {
-  if (file._broken) throw new Error("decode failed");
-  return { width: file._w, height: file._h, close() {} };
-};
-
-// canvas: records what it was asked to draw so downscaling can be asserted
-let lastCanvas = null;
-
-/* --- Blob / file stubs -----------------------------------------------------
-   GJS has no Blob, Response or CompressionStream. The absent compression
-   streams are deliberate: the writer must fall back to storing, and a
-   store-only archive is what the round-trip test then exercises. */
-
-globalThis.Blob = class Blob {
-  constructor(parts = [], options = {}) {
-    let total = 0;
-    for (const part of parts) total += part.length ?? part.byteLength ?? 0;
-    const merged = new Uint8Array(total);
-    let at = 0;
-    for (const part of parts) {
-      const bytes = part instanceof Uint8Array ? part : new Uint8Array(part);
-      merged.set(bytes, at);
-      at += bytes.length;
-    }
-    this._bytes = merged;
-    this.size = merged.length;
-    this.type = options.type || "";
-  }
-  async arrayBuffer() {
-    return this._bytes.buffer.slice(
-      this._bytes.byteOffset, this._bytes.byteOffset + this._bytes.byteLength);
-  }
-};
-
-/** A File carrying real bytes, for archive round-trips. */
-function fileWithBytes(name, bytes) {
-  return {
-    name,
-    type: "application/zip",
-    size: bytes.length,
-    async arrayBuffer() {
-      return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-    },
-  };
-}
-
-const downloads = [];
-
-/* --- fake IndexedDB --------------------------------------------------------
-   Faithful enough for this app's use: requests settle on the microtask queue,
-   transactions fire oncomplete once their requests have all settled. It is a
-   stand-in, not a conformance suite — real IDB semantics around transaction
-   lifetime are only approximated. */
-
-function makeFakeIndexedDb() {
-  const stores = new Map();
-  let failNextWrite = null;
-
-  const clone = value =>
-    (value && typeof value.arrayBuffer === "function") ? value : JSON.parse(JSON.stringify(value));
-
-  const db = {
-    objectStoreNames: { contains: name => stores.has(name) },
-    createObjectStore(name) { stores.set(name, new Map()); return {}; },
-    close() {},
-    transaction(names, mode) {
-      const tx = { pending: 0, done: false, error: null,
-                   oncomplete: null, onerror: null, onabort: null };
-
-      const settle = () => {
-        tx.pending--;
-        if (tx.pending === 0 && !tx.done) {
-          tx.done = true;
-          Promise.resolve().then(() => tx.oncomplete && tx.oncomplete());
-        }
-      };
-
-      tx.objectStore = name => {
-        const map = stores.get(name);
-        const request = compute => {
-          const r = { result: undefined, error: null, onsuccess: null, onerror: null };
-          tx.pending++;
-          Promise.resolve().then(() => {
-            if (failNextWrite && mode === "readwrite") {
-              tx.error = new Error(failNextWrite);
-              failNextWrite = null;
-              tx.done = true;
-              tx.pending = 0;
-              if (tx.onerror) tx.onerror();
-              return;
-            }
-            r.result = compute();
-            if (r.onsuccess) r.onsuccess();
-            settle();
-          });
-          return r;
-        };
-        return {
-          put: (value, key) => request(() => map.set(key, clone(value))),
-          get: key => request(() => map.get(key)),
-          delete: key => request(() => map.delete(key)),
-          clear: () => request(() => map.clear()),
-          getAllKeys: () => request(() => [...map.keys()]),
-        };
-      };
-
-      Promise.resolve().then(() => {
-        if (tx.pending === 0 && !tx.done) { tx.done = true; tx.oncomplete && tx.oncomplete(); }
-      });
-      return tx;
-    },
-  };
-
-  return {
-    stores,
-    failNextWriteWith(message) { failNextWrite = message; },
-    api: {
-      open() {
-        const request = { result: null, error: null,
-                          onsuccess: null, onerror: null, onupgradeneeded: null, onblocked: null };
-        Promise.resolve().then(() => {
-          request.result = db;
-          if (stores.size === 0 && request.onupgradeneeded) request.onupgradeneeded();
-          if (request.onsuccess) request.onsuccess();
-        });
-        return request;
-      },
-    },
-  };
-}
-
-let fakeDb = makeFakeIndexedDb();
-globalThis.indexedDB = fakeDb.api;
-
-/** run one animation frame (draining what was queued before it) */
-const tick = () => { const due = frameQueue; frameQueue = []; for (const fn of due) fn(); };
-
-/* ========================================================================== */
-/* load the app                                                               */
-/* ========================================================================== */
 
 if (!GLib.file_test(TARGET, GLib.FileTest.EXISTS)) {
   print("Cannot find " + TARGET + " — run this from the project directory, " +
@@ -414,141 +29,16 @@ if (!GLib.file_test(TARGET, GLib.FileTest.EXISTS)) {
   imports.system.exit(1);
 }
 
-const [, bytes] = GLib.file_get_contents(TARGET);
-const html = new TextDecoder().decode(bytes);
-const source = html.slice(html.lastIndexOf("<script>") + 8, html.lastIndexOf("</script>"));
-
-let api;
-try {
-  api = new Function(source + `
-    ;return { get state() { return state; }, runtime, render, locateItem, getTier,
-              addItem, addTier, renameTier, deleteTier, deleteItem,
-              armDelete, clearPendingDelete,
-              onBoardPointerDown, insertionRef, zoneAt, endDrag,
-              syncListFromDom, syncTiersFromDom, tierInsertionRef,
-              openPanel, closePanel, updateItem, refreshItemCard, findCardNode,
-              attachImage, removeImage, setShortType, releaseImage, readImageFile,
-              buildZip, readZip, unpack, crc32, serializeDocument, slugify,
-              buildArchiveBytes, readArchive, installDocument, importList,
-              undo, redo, history, toggleGrab, cancelGrab, dropGrab,
-              onCardKeyDown, onGripKeyDown, renderSnapshot, exportSnapshot,
-              announce, pushHistory, clearHistory, collectImages, isUndoShortcut,
-              initStorage, saveNow, saveSession, loadSession, restoreSession,
-              clearStoredSession, newList, adoptManifest, createEmptyDocument,
-              requestImport, exportList, showBanner, dismissBanner };
-  `)();
-} catch (e) {
-  print("ERROR loading app: " + e + "\n" + (e.stack || ""));
-  imports.system.exit(1);
-}
-print("boot: OK");
-
-// `state` is rebound wholesale on import, so reads must go through the app
-// rather than through a captured reference.
-const s = new Proxy({}, {
-  get: (_, key) => api.state[key],
-  set: (_, key, value) => { api.state[key] = value; return true; },
-});
-
-/* ========================================================================== */
-/* fake layout                                                                */
-/* ========================================================================== */
-
-const CARD = 88, GAP = 8, PAD = 8, PER_ROW = 6, ZONE_L = 120, ZONE_R = 900;
-
-/** Assigns plausible rects to rows, drop zones and cards. Re-run after moves. */
-function layout() {
-  let y = 100;
-
-  for (const row of tiersEl.children) {
-    const zone = row.find("tier-drop");
-    const cards = zone.children.filter(c => c.classList.contains("item"));
-    const rows = Math.max(1, Math.ceil(cards.length / PER_ROW));
-    const h = PAD * 2 + rows * CARD + (rows - 1) * GAP;
-
-    row._rect = { left: 0, right: 1000, top: y, bottom: y + h, width: 1000, height: h };
-    zone._rect = { left: ZONE_L, right: ZONE_R, top: y, bottom: y + h, width: ZONE_R - ZONE_L, height: h };
-    placeCards(cards, y);
-    y += h + 2;
-  }
-
-  tiersEl._rect = { left: 0, right: 1000, top: 100, bottom: y, width: 1000, height: y - 100 };
-
-  const poolCards = poolDrop.children.filter(c => c.classList.contains("item"));
-  const poolRows = Math.max(1, Math.ceil(poolCards.length / PER_ROW));
-  const poolH = PAD * 2 + poolRows * CARD + (poolRows - 1) * GAP;
-  y += 24;
-  poolDrop._rect = { left: ZONE_L, right: ZONE_R, top: y, bottom: y + poolH, width: ZONE_R - ZONE_L, height: poolH };
-  placeCards(poolCards, y);
-}
-
-function placeCards(cards, zoneTop) {
-  cards.forEach((card, i) => {
-    const col = i % PER_ROW, row = Math.floor(i / PER_ROW);
-    const left = ZONE_L + PAD + col * (CARD + GAP);
-    const top = zoneTop + PAD + row * (CARD + GAP);
-    card._rect = { left, top, right: left + CARD, bottom: top + CARD, width: CARD, height: CARD };
-  });
-}
-
-const zoneOf = i => tiersEl.children[i].find("tier-drop");
-const idsIn = zone => zone.children.filter(c => c.classList.contains("item")).map(c => c.dataset.itemId);
-const cardFor = id => boardScroll.querySelectorAll(".item").find(c => c.dataset.itemId === id);
-
-/** Drives a full press -> move -> release gesture in viewport coordinates. */
-function gesture(eventTarget, startRect, path, opts = {}) {
-  const pointerType = opts.pointerType || "mouse";
-  const startX = startRect.left + 20;
-  const startY = startRect.top + 20;
-
-  api.onBoardPointerDown({
-    target: eventTarget, pointerType, button: 0, pointerId: 1,
-    clientX: startX, clientY: startY,
-  });
-
-  // Touch has to hold still for the long press before it becomes a drag.
-  if (pointerType !== "mouse" && opts.holdFirst !== false) fireTimers();
-
-  for (const [x, y] of path) {
-    fireWindow("pointermove", {
-      pointerId: 1, clientX: x, clientY: y, preventDefault() {}, target: eventTarget,
-    });
-    layout();
-    tick();
-  }
-
-  if (opts.escape) { api.endDrag(false); return; }
-  if (opts.release !== false) fireWindow("pointerup", { pointerId: 1, target: eventTarget });
-}
-
-function drag(itemId, path, opts) {
-  const card = cardFor(itemId);
-  return gesture(card, card._rect, path, opts);
-}
-
-function dragTier(index, path, opts) {
-  const row = tiersEl.children[index];
-  return gesture(row.find("tier-grip"), row._rect, path, opts);
-}
-
-/* ========================================================================== */
-/* assertions                                                                 */
-/* ========================================================================== */
-
-let failed = 0;
-function check(label, cond) {
-  print((cond ? "PASS  " : "FAIL  ") + label);
-  if (!cond) failed++;
-}
-function integrity(label) {
-  const seen = new Set();
-  let bad = 0;
-  for (const id of [...s.tiers.flatMap(t => t.items), ...s.pool]) {
-    if (seen.has(id) || !s.items[id]) bad++;
-    seen.add(id);
-  }
-  check(label, bad === 0 && seen.size === Object.keys(s.items).length);
-}
+const env = imports.harness.Harness.create(TARGET);
+const {
+  api, state: s, Node, shell, boardScroll, tiersEl, poolDrop, panel, main, liveEl,
+  check, integrity, run,
+  layout, zoneOf, cardFor, drag, dragTier, gesture,
+  tick, fireTimers, fireWindow, settle,
+  fakeFile, fileWithBytes, downloads, canvas,
+  urlsMinted, urlsRevoked,
+  CARD, ZONE_L,
+} = env;
 
 /* --- phase 0 / 1 ---------------------------------------------------------- */
 
@@ -926,7 +416,7 @@ async function phase5() {
     cardFor(subject).find("item-body")._class.includes("is-empty"));
 
   // attach a small image: no downscale
-  lastCanvas = null;
+  canvas.last = null;
   await api.attachImage(subject, fakeFile("holiday.png", "image/png", { w: 400, h: 300 }));
   const path = s.items[subject].image;
   check("item now points at an archive path", typeof path === "string" && path.startsWith("images/"));
@@ -935,7 +425,7 @@ async function phase5() {
   check("manifest entry written", s.images[path] !== undefined);
   check("original filename preserved", s.images[path].filename === "holiday.png");
   check("dimensions recorded", s.images[path].width === 400 && s.images[path].height === 300);
-  check("a small image is not re-encoded", lastCanvas === null);
+  check("a small image is not re-encoded", canvas.last === null);
   check("state holds no bytes", s.images[path].blob === undefined);
 
   // the card renders it
@@ -978,10 +468,10 @@ async function phase5() {
   check("old object URL revoked", urlsRevoked.has(oldUrl));
 
   // oversized images are downscaled and re-encoded to webp
-  lastCanvas = null;
+  canvas.last = null;
   await api.attachImage(subject, fakeFile("huge.png", "image/png", { w: 4000, h: 2000 }));
   const bigPath = s.items[subject].image;
-  check("oversized image was re-encoded", lastCanvas !== null);
+  check("oversized image was re-encoded", canvas.last !== null);
   check("longest edge clamped to 1024", s.images[bigPath].width === 1024);
   check("aspect ratio preserved", s.images[bigPath].height === 512);
   check("re-encoded as webp", s.images[bigPath].mime === "image/webp");
@@ -989,9 +479,9 @@ async function phase5() {
   check("original filename still recorded", s.images[bigPath].filename === "huge.png");
 
   // animated GIFs bypass the canvas so the animation survives
-  lastCanvas = null;
+  canvas.last = null;
   await api.attachImage(subject, fakeFile("dance.gif", "image/gif", { w: 3000, h: 3000 }));
-  check("a large GIF is passed through untouched", lastCanvas === null);
+  check("a large GIF is passed through untouched", canvas.last === null);
   check("GIF keeps its full size", s.images[s.items[subject].image].width === 3000);
   check("GIF keeps its type", s.images[s.items[subject].image].mime === "image/gif");
 
@@ -1295,19 +785,9 @@ async function flushSave() {
   await settle();
 }
 
-/** let queued microtasks (the fake IDB's requests) run to completion */
-function settle() {
-  return new Promise(resolve => {
-    let spins = 0;
-    const step = () => (++spins < 40 ? Promise.resolve().then(step) : resolve());
-    step();
-  });
-}
-
 async function phase7() {
   // earlier phases already triggered saves — start from an empty database
-  fakeDb = makeFakeIndexedDb();
-  globalThis.indexedDB = fakeDb.api;
+  const fakeDb = env.resetDatabase();
   api.runtime.storage.available = null;
   api.runtime.storage.db = null;
 
@@ -1629,9 +1109,9 @@ async function phase8() {
   const png = await api.renderSnapshot();
   check("a snapshot was produced", png !== null && png.type === "image/png");
 
-  const drawn = lastCanvas.getContext().calls;
-  check("the snapshot canvas was sized", lastCanvas.width > 0 && lastCanvas.height > 0);
-  check("...at 2x for sharpness", lastCanvas.width % 2 === 0);
+  const drawn = canvas.last.getContext().calls;
+  check("the snapshot canvas was sized", canvas.last.width > 0 && canvas.last.height > 0);
+  check("...at 2x for sharpness", canvas.last.width % 2 === 0);
 
   await api.exportSnapshot();
   check("saving a picture names it from the title",
@@ -1647,128 +1127,9 @@ async function phase8() {
 }
 
 
-/* ========================================================================== */
-/* phase 9: archives from other writers                                       */
-/* ========================================================================== */
-
-const FIXTURES = GLib.path_get_dirname(TARGET) + "/fixtures";
-
-/** GJS has no DecompressionStream, but GLib has raw zlib. */
-function inflateRawGio(bytes) {
-  const decompressor = Gio.ZlibDecompressor.new(Gio.ZlibCompressorFormat.RAW);
-  const input = Gio.MemoryInputStream.new_from_bytes(new GLib.Bytes(bytes));
-  const converted = Gio.ConverterInputStream.new(input, decompressor);
-  const output = Gio.MemoryOutputStream.new_resizable();
-  output.splice(converted,
-    Gio.OutputStreamSpliceFlags.CLOSE_SOURCE | Gio.OutputStreamSpliceFlags.CLOSE_TARGET,
-    null);
-  return new Uint8Array(output.steal_as_bytes().get_data());
-}
-
-function readFixture(relative) {
-  const [, bytes] = GLib.file_get_contents(FIXTURES + "/" + relative);
-  return new Uint8Array(bytes);
-}
-
-const sameBytes = (a, b) => a.length === b.length && a.every((byte, i) => byte === b[i]);
-
-async function phase9() {
-  if (!GLib.file_test(FIXTURES, GLib.FileTest.IS_DIR)) {
-    print("SKIP  archive fixtures not found at " + FIXTURES);
-    return;
-  }
-
-  // What the reader should produce, taken from disk rather than the archive.
-  const expected = {
-    "tierlist.json": readFixture("src/tierlist.json"),
-    "images/img_alpha.png": readFixture("src/images/img_alpha.png"),
-    "images/img_beta.png": readFixture("src/images/img_beta.png"),
-  };
-
-  const readable = (label, filename) => {
-    const files = api.readZip(readFixture(filename));
-    check(label + ": all three files found", files.size === 3);
-    check(label + ": directory entries skipped", !files.has("images/"));
-
-    for (const [name, want] of Object.entries(expected)) {
-      const entry = files.get(name);
-      if (!entry) { check(label + ": " + name + " present", false); continue; }
-      check(label + ": " + name + " reports its real size", entry.size === want.length);
-      // Inflating here with GLib proves the reader sliced the right bytes,
-      // which is the part that depends on header layout.
-      const got = entry.method === 0 ? entry.raw : inflateRawGio(entry.raw);
-      check(label + ": " + name + " is byte-exact (method " + entry.method + ")",
-        sameBytes(got, want));
-    }
-  };
-
-  // 7-Zip puts 36 bytes of extra field in the central directory and none in
-  // local headers; libarchive does the opposite, 24 central against 32 local,
-  // and sets the data-descriptor flag so its local size fields read zero.
-  // Trusting either one's layout misreads every entry from the other.
-  readable("7-Zip/deflate", "7z-deflate.tierlist");
-  readable("7-Zip/store", "7z-store.tierlist");
-  readable("libarchive/deflate", "bsdtar-deflate.tierlist");
-  readable("libarchive/store", "bsdtar-store.tierlist");
-  readable("python/deflate", "py-deflate.tierlist");
-  readable("python/store", "py-store.tierlist");
-
-  const commented = api.readZip(readFixture("py-comment.tierlist"));
-  check("a trailing archive comment does not hide the EOCD", commented.size === 3);
-  check("...and the manifest still reads",
-    sameBytes(await api.unpack(commented.get("tierlist.json")), expected["tierlist.json"]));
-
-  // LZMA inside a ZIP: a method this reader does not implement.
-  const lzma = api.readZip(readFixture("7z-lzma.tierlist"));
-  check("an archive using an unsupported method still parses", lzma.size === 3);
-  check("...entries this reader can handle are unaffected",
-    sameBytes(await api.unpack(lzma.get("images/img_alpha.png")),
-              expected["images/img_alpha.png"]));
-  let refusal = null;
-  try { await api.unpack(lzma.get("tierlist.json")); }
-  catch (error) { refusal = error.message; }
-  check("...and the unsupported entry is refused, not misread",
-    refusal !== null && refusal.includes("Unsupported compression"));
-  check("...naming the method", refusal !== null && refusal.includes("14"));
-
-  // Stored archives can go all the way through the import path.
-  for (const [label, filename] of [["7-Zip", "7z-store.tierlist"],
-                                   ["libarchive", "bsdtar-store.tierlist"],
-                                   ["python", "py-store.tierlist"]]) {
-    await api.importList(fileWithBytes(filename, readFixture(filename)));
-    check(label + ": imported end to end", s.title === "External Archive Test");
-    check(label + ": tiers restored", s.tiers.length === 2 && s.tiers[0].name === "S");
-    check(label + ": placements restored",
-      s.tiers[0].items[0] === "i_1" && s.pool[0] === "i_3");
-    check(label + ": image bytes intact",
-      sameBytes(api.runtime.images.get("images/img_alpha.png").blob._bytes,
-                expected["images/img_alpha.png"]));
-    check(label + ": no repairs were needed", api.runtime.banner.tone === "info");
-    integrity(label + ": integrity after a foreign archive");
-  }
-
-  fireTimers();
-  const live = new Set([...api.runtime.images.values()].map(e => e.url));
-  const loose = [...urlsMinted].filter(u => !urlsRevoked.has(u) && !live.has(u));
-  check("no object URL leaked across the whole run (" + urlsMinted.size +
-        " minted, " + urlsRevoked.size + " revoked, " + live.size + " live)",
-        loose.length === 0);
-}
-
-const loop = GLib.MainLoop.new(null, false);
-(async () => {
-  try {
-    await phase5();
-    await phase6();
-    await phase7();
-    await phase8();
-    await phase9();
-  } catch (e) {
-    print("ERROR in async phases: " + e + "\n" + (e.stack || ""));
-    failed++;
-  }
-  print("");
-  print(failed ? `*** ${failed} CHECK(S) FAILED ***` : "all checks passed");
-  loop.quit();
-})();
-loop.run();
+run(async () => {
+  await phase5();
+  await phase6();
+  await phase7();
+  await phase8();
+});
