@@ -118,10 +118,19 @@ gjs smoke.js                       # from this directory
 gjs smoke.js path/to/tierlist.html # from anywhere
 ```
 
-350 assertions covering state transitions, the drag engine's insertion maths, panel
+423 assertions covering state transitions, the drag engine's insertion maths, panel
 editing, the image pipeline, ZIP round-trips, import repair, persistence, undo, and
 keyboard placement. Every object URL minted and revoked is tracked, so a leak fails the
 run.
+
+The last group reads archives in `fixtures/`, written by 7-Zip, libarchive and Python's
+`zipfile` — three writers that lay out ZIP headers differently, which is what a
+hand-written reader has to survive. Those archives are committed, so the tests run
+anywhere; regenerating them needs 7-Zip and bsdtar:
+
+```sh
+python3 fixtures/make-fixtures.py
+```
 
 It cannot cover CSS, layout, animation, or actual pixels, and the fakes only approximate
 their real counterparts. A pass means the logic holds — not that the app looks right.

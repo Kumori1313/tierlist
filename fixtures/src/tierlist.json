@@ -1,0 +1,73 @@
+{
+  "schema": 1,
+  "app": "tierlist",
+  "title": "External Archive Test",
+  "createdAt": "2026-08-03T00:00:00.000Z",
+  "modifiedAt": "2026-08-03T00:00:00.000Z",
+  "tiers": [
+    {
+      "id": "t_s",
+      "name": "S",
+      "color": "#ff7f7f",
+      "items": [
+        "i_1"
+      ]
+    },
+    {
+      "id": "t_a",
+      "name": "A",
+      "color": "#ffbf7f",
+      "items": [
+        "i_2"
+      ]
+    }
+  ],
+  "pool": [
+    "i_3"
+  ],
+  "items": {
+    "i_1": {
+      "id": "i_1",
+      "name": "Alpha",
+      "shortType": "image",
+      "shortText": "kept",
+      "image": "images/img_alpha.png",
+      "description": "first",
+      "accent": null
+    },
+    "i_2": {
+      "id": "i_2",
+      "name": "Beta",
+      "shortType": "image",
+      "shortText": "",
+      "image": "images/img_beta.png",
+      "description": "second",
+      "accent": null
+    },
+    "i_3": {
+      "id": "i_3",
+      "name": "Gamma",
+      "shortType": "text",
+      "shortText": "no picture",
+      "image": null,
+      "description": "third",
+      "accent": null
+    }
+  },
+  "images": {
+    "images/img_alpha.png": {
+      "filename": "img_alpha.png",
+      "mime": "image/png",
+      "bytes": 69,
+      "width": 1,
+      "height": 1
+    },
+    "images/img_beta.png": {
+      "filename": "img_beta.png",
+      "mime": "image/png",
+      "bytes": 72,
+      "width": 2,
+      "height": 2
+    }
+  }
+}
